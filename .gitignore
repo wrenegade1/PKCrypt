@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# C++ build artifacts
+*.o
+src/*.o
+/pkcrypt
+
+
+# OS
+.DS_Store
