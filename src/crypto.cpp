@@ -1,3 +1,10 @@
+//
+// PKCrypt - encrypt files so that only the holder of an Ed25519 SSH private
+// key can decrypt them (same public/private key model as SSH).
+//
+// Author: Warren Zajac
+//
+
 #include "pkcrypt/crypto.h"
 
 #include <cstring>

@@ -1,6 +1,11 @@
 #ifndef PKCRYPT_VERSION_H
 #define PKCRYPT_VERSION_H
 
+//
+// PKCrypt version information.
+// Author: Warren Zajac
+//
+
 #define PKCRYPT_VERSION_MAJOR 1
 #define PKCRYPT_VERSION_MINOR 0
 #define PKCRYPT_VERSION_PATCH 0

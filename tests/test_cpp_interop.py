@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Cross-language interoperability tests for PKCrypt.
 
+Author: Warren Zajac
+
 Verifies that the compiled C++ binary (./pkcrypt) and the Python package
 (pkcrypt_lib) produce and consume files interchangeably, i.e. a file encrypted
 by either tool can be decrypted by the other, using the same Ed25519 SSH keys.

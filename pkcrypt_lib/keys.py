@@ -1,5 +1,7 @@
 """Loading OpenSSH Ed25519 key files.
 
+Author: Warren Zajac
+
 Uses ``cryptography``'s native OpenSSH parsing for robustness. We deliberately
 restrict to Ed25519 keys (the modern, default ``ssh-keygen -t ed25519`` type),
 which is what PKCrypt is designed around.

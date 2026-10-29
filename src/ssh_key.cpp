@@ -1,3 +1,10 @@
+//
+// PKCrypt - encrypt files so that only the holder of an Ed25519 SSH private
+// key can decrypt them (same public/private key model as SSH).
+//
+// Author: Warren Zajac
+//
+
 #include "pkcrypt/ssh_key.h"
 
 #include <fstream>
@@ -8,8 +15,8 @@
 #include <cstdint>
 #include <algorithm>
 
-// Base64 decoding: see base64.h.
-#include "pkcrypt/base64.hpp"
+// Own base64 decoder (see base64.cpp), verified against the reference.
+#include "pkcrypt/base64.h"
 
 namespace pkcrypt {
 
@@ -55,24 +62,9 @@ private:
     size_t pos_ = 0;
 };
 
-// OpenSSH keys have base64 with standard alphabet. The public key token has no
-// newlines; the private key armor may be wrapped across lines, so strip ASCII
-// whitespace before decoding.
-bool base64_decode(const std::string& in, std::vector<unsigned char>& out) {
-    std::string compact;
-    compact.reserve(in.size());
-    for (char c : in) {
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
-        compact.push_back(c);
-    }
-    try {
-        std::string decoded = base64::from_base64(compact);
-        out.assign(decoded.begin(), decoded.end());
-        return true;
-    } catch (const std::runtime_error&) {
-        return false;
-    }
-}
+// OpenSSH keys use the standard base64 alphabet. The public key token has no
+// newlines; the private key armor may be wrapped across lines. pkcrypt::base64_decode
+// handles whitespace stripping internally, so we call it directly.
 
 // Extract the base64 token and the "ssh-ed25519" type from an OpenSSH public key line.
 bool parse_public_line(const std::string& line, std::vector<unsigned char>& raw,

@@ -1,5 +1,7 @@
 # PKCrypt
 
+**Author:** Warren Zajac
+
 Encrypt a file so that **only the holder of a specific Ed25519 SSH private key** can
 decrypt it — using the same public / private key model as SSH.
 
@@ -402,9 +404,9 @@ make clean
 make test
 ```
 
-The repo is intentionally simple: no submodules, no generated code, no network needed
-at build time (the only vendored third-party file is `base64.hpp`, committed under
-`include/pkcrypt/`).
+The repo is intentionally simple: no submodules, no generated code, and no network
+needed at build time — every source file (C++ and Python) is written in-house. The
+only external dependency is the libsodium and `cryptography` libraries you install.
 
 ### Running the test suites
 
@@ -472,10 +474,11 @@ PKCrypt/
 │   ├── pkcrypt.cpp         #   CLI (encrypt / decrypt)
 │   ├── ssh_key.cpp         #   OpenSSH key parsing
 │   ├── crypto.cpp          #   X25519 + HKDF-SHA256 + AES-256-GCM
-│   └── fileio.cpp          #   file I/O
+│   ├── fileio.cpp          #   file I/O
+│   └── base64.cpp          #   own base64 decoder/encoder (RFC 4648)
 ├── include/pkcrypt/        # C++ headers
 │   ├── crypto.h  ssh_key.h  fileio.h  version.h
-│   └── base64.hpp          #   base64 decoding
+│   └── base64.h            #   own base64 API
 ├── tests/                  # test suites
 │   ├── test_roundtrip.py   #   Python unit tests (pytest)
 │   └── test_cpp_interop.py #   cross-language interop (make test)
@@ -509,10 +512,17 @@ Contributions and ideas are welcome — open an issue or a pull request.
 
 ## License & attribution
 
+**Author and maintainer:** Warren Zajac
+
 PKCrypt is released under the **Apache License, Version 2.0**. See the repository license file for the
 full text.
 
-Third-party software bundled in this repository:
+The base64 encoder/decoder in `src/base64.cpp` is **our own** implementation,
+written in-house and verified byte-for-byte against the standard reference (the
+Python `base64` module) over real OpenSSH keys, all input-length classes, padding
+variants, and embedded newline wrapping.
+
+The implementation relies on (but does not bundle) these third-party libraries:
 
 | Component | License | Purpose |
 |-----------|---------|---------|

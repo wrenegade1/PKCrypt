@@ -1,4 +1,7 @@
-# PKCrypt - encrypt files with a recipient's Ed25519 SSH public key.
+# PKCrypt - encrypt files so that only the holder of an Ed25519 SSH private
+# key can decrypt them (same public/private key model as SSH).
+#
+# Author: Warren Zajac
 #
 # Requires: libsodium (brew install libsodium)
 #   and cryptography (pip install cryptography), used by tests/ for interop.
@@ -17,7 +20,7 @@ else
   LDFLAGS  +=
 endif
 
-SRCS = src/pkcrypt.cpp src/ssh_key.cpp src/crypto.cpp src/fileio.cpp
+SRCS = src/pkcrypt.cpp src/ssh_key.cpp src/crypto.cpp src/fileio.cpp src/base64.cpp
 HDRS = $(wildcard include/pkcrypt/*.h include/pkcrypt/*.hpp)
 OBJS = $(SRCS:.cpp=.o)
 

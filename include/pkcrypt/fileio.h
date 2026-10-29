@@ -1,6 +1,12 @@
 #ifndef PKCRYPT_FILEIO_H
 #define PKCRYPT_FILEIO_H
 
+//
+// PKCrypt - encrypt files so only the holder of an Ed25519 SSH private key
+// can decrypt them (same public/private key model as SSH).
+// Author: Warren Zajac
+//
+
 #include <string>
 #include <vector>
 

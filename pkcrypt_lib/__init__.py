@@ -1,4 +1,7 @@
-"""PKCrypt: encrypt files so only the holder of an Ed25519 SSH private key can decrypt them."""
+"""PKCrypt: encrypt files so only the holder of an Ed25519 SSH private key can decrypt them.
+
+Author: Warren Zajac
+"""
 
 from . import core
 from .core import __version__

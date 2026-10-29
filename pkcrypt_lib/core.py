@@ -1,6 +1,8 @@
 """PKCrypt: encrypt files so that only the holder of an Ed25519 SSH private
 key can decrypt them, using the same public/private key model as SSH.
 
+Author: Warren Zajac
+
 Design
 ------
 A sender encrypts a file using only the recipient's *public* Ed25519 key

@@ -1,5 +1,7 @@
 """End-to-end tests for PKCrypt.
 
+Author: Warren Zajac
+
 Run with:  python3 -m pytest tests/ -v
 (or:       python3 tests/test_roundtrip.py)
 

@@ -1,5 +1,7 @@
 """PKCrypt command line interface.
 
+Author: Warren Zajac
+
 Two logical apps in one command:
 
   * ``pkcrypt encrypt <recipient.pub> <file>``  -- anything, run anywhere, needs

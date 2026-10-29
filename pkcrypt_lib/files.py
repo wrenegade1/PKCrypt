@@ -1,4 +1,7 @@
-"""File I/O helpers for the PKCrypt CLI."""
+"""File I/O helpers for the PKCrypt CLI.
+
+Author: Warren Zajac
+"""
 
 from __future__ import annotations
 

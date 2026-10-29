@@ -12,8 +12,10 @@ All notable changes to PKCrypt are documented here. This project follows
     the C++ and Python tools can decrypt each other's files interchangeably.
   - Uses libsodium (X25519 ECDH + HKDF-SHA256 + AES-256-GCM) matching the
     Python scheme exactly.
-  - Base64 decoding for OpenSSH key parsing
-    (`include/pkcrypt/base64.hpp`).
+  - **Own base64 encoder/decoder** (`src/base64.cpp`, `include/pkcrypt/base64.h`)
+    written in-house, verified byte-for-byte against the reference (Python
+    `base64`) over real OpenSSH keys, all input-length classes, padding
+    variants, and embedded newline wrapping.
   - `make test` runs a 9-case cross-language interop suite
     (`tests/test_cpp_interop.py`).
 
@@ -24,6 +26,11 @@ All notable changes to PKCrypt are documented here. This project follows
   file format specification, threat model and security considerations,
   interoperability, development/testing, troubleshooting, project layout,
   roadmap, and license/attribution.
+- Replaced the previously vendored third-party `tobiaslocker/base64` header with
+  our own in-house base64 implementation (no bundled third-party code remains).
+- Added author attribution (Warren Zajac) to file headers, comments, and pyproject
+  metadata across the codebase.
+- Added the `LICENSE` file (Apache License 2.0).
 
 ## [1.0.0] - 2026-10-28
 
