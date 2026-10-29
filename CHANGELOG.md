@@ -17,6 +17,14 @@ All notable changes to PKCrypt are documented here. This project follows
   - `make test` runs a 9-case cross-language interop suite
     (`tests/test_cpp_interop.py`).
 
+### Changed
+
+- Expanded `README.md` into a detailed guide covering quick start, install for
+  both implementations, full usage and workflow, the crypto design, the on-disk
+  file format specification, threat model and security considerations,
+  interoperability, development/testing, troubleshooting, project layout,
+  roadmap, and license/attribution.
+
 ## [1.0.0] - 2026-10-28
 
 ### Added
