@@ -1,0 +1,36 @@
+name: CI
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install libsodium (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install libsodium
+      - name: Install libsodium (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsodium-dev
+      - name: Install Python package + test deps
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -e ".[test]"
+      - name: C++ build + interop suite (make test)
+        run: make test
+      - name: Python test suite (pytest)
+        run: python3 -m pytest tests/
