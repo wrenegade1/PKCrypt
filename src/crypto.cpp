@@ -137,27 +137,75 @@ bool aes256gcm_ready(std::string& error) {
 
 } // namespace
 
-std::vector<unsigned char> encrypt_bytes(
-    const std::vector<unsigned char>& plaintext,
-    const unsigned char recipient_ed25519_public[32],
-    unsigned char cipher, size_t chunk_len, std::string& error) {
+namespace {
 
+constexpr char DECRYPT_FAILED[] =
+    "decryption failed: file is not for this private key, or it was tampered with or truncated";
+
+// AEAD seal/open of one chunk with the cipher selected by `is_aes`.
+int aead_encrypt(bool is_aes, unsigned char* c, unsigned long long* clen,
+                 const unsigned char* m, size_t mlen, const std::vector<unsigned char>& aad,
+                 const unsigned char* nonce, const unsigned char* key) {
+    return is_aes
+        ? crypto_aead_aes256gcm_encrypt(c, clen, m, mlen, aad.data(), aad.size(),
+                                        nullptr, nonce, key)
+        : crypto_aead_xchacha20poly1305_ietf_encrypt(c, clen, m, mlen, aad.data(), aad.size(),
+                                                     nullptr, nonce, key);
+}
+
+int aead_decrypt(bool is_aes, unsigned char* m, unsigned long long* mlen,
+                 const unsigned char* c, size_t clen, const std::vector<unsigned char>& aad,
+                 const unsigned char* nonce, const unsigned char* key) {
+    return is_aes
+        ? crypto_aead_aes256gcm_decrypt(m, mlen, nullptr, c, clen, aad.data(), aad.size(),
+                                        nonce, key)
+        : crypto_aead_xchacha20poly1305_ietf_decrypt(m, mlen, nullptr, c, clen, aad.data(),
+                                                     aad.size(), nonce, key);
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// StreamEncryptor
+// ---------------------------------------------------------------------------
+
+StreamEncryptor::~StreamEncryptor() { wipe(); }
+
+void StreamEncryptor::wipe() {
+    sodium_memzero(key_, sizeof key_);
+    if (!pending_.empty()) sodium_memzero(pending_.data(), pending_.size());
+    pending_.clear();
+    active_ = false;
+}
+
+bool StreamEncryptor::begin(ByteSink& out, const unsigned char recipient_ed25519_public[32],
+                            unsigned char payload_type, std::string& error,
+                            unsigned char cipher, size_t chunk_len) {
+    wipe();
     if (cipher != CIPHER_AES && cipher != CIPHER_XCHACHA20) {
         error = "unsupported cipher";
-        return {};
+        return false;
     }
-    if (chunk_len == 0) { error = "chunk_len must be positive"; return {}; }
-
-    if (cipher == CIPHER_AES && !aes256gcm_ready(error)) return {};
-
-    size_t nonce_len = (cipher == CIPHER_AES) ? NONCE_BYTES_AES : NONCE_BYTES_XC;
+    if (payload_type != PAYLOAD_FILE && payload_type != PAYLOAD_ARCHIVE) {
+        error = "unsupported payload type";
+        return false;
+    }
+    if (chunk_len == 0 || chunk_len > MAX_ACCEPTED_CHUNK_LEN) {
+        error = "chunk_len must be between 1 and 16 MiB";
+        return false;
+    }
+    if (cipher == CIPHER_AES && !aes256gcm_ready(error)) return false;
+    is_aes_ = (cipher == CIPHER_AES);
+    nonce_len_ = is_aes_ ? NONCE_BYTES_AES : NONCE_BYTES_XC;
+    chunk_len_ = chunk_len;
+    index_ = 0;
 
     // 1. Convert recipient's Ed25519 public key to X25519.
     unsigned char recipient_x_pub[32];
     Ed25519Key recipient;
     std::memcpy(recipient.public_key, recipient_ed25519_public, 32);
     recipient.has_private = false;
-    if (!to_curve25519(recipient, recipient_x_pub, nullptr, error)) return {};
+    if (!to_curve25519(recipient, recipient_x_pub, nullptr, error)) return false;
 
     // 2. Fresh ephemeral X25519 keypair (forward secrecy + sender anonymity).
     unsigned char eph_pk[32], eph_sk[32];
@@ -165,97 +213,157 @@ std::vector<unsigned char> encrypt_bytes(
 
     // 3. ECDH: shared = eph_sk * recipient_x_pub.
     unsigned char shared[32];
-    if (crypto_scalarmult(shared, eph_sk, recipient_x_pub) != 0) {
-        error = "X25519 ECDH failed";
-        sodium_memzero(eph_sk, sizeof eph_sk);
-        return {};
-    }
+    int rc = crypto_scalarmult(shared, eph_sk, recipient_x_pub);
     sodium_memzero(eph_sk, sizeof eph_sk);
+    if (rc != 0) {
+        error = "X25519 ECDH failed";
+        return false;
+    }
 
     // 4. Derive the AEAD key via HKDF-SHA256 (v2 label).
-    unsigned char key[KEY_BYTES];
-    if (!derive_key(shared, eph_pk, recipient_x_pub, HKDF_INFO_V2,
-                    sizeof(HKDF_INFO_V2) - 1, key)) {
-        error = "key derivation failed";
-        sodium_memzero(shared, sizeof shared);
-        return {};
-    }
+    bool derived = derive_key(shared, eph_pk, recipient_x_pub, HKDF_INFO_V2,
+                              sizeof(HKDF_INFO_V2) - 1, key_);
     sodium_memzero(shared, sizeof shared);
-
-    // 5. Random base nonce.
-    unsigned char base_nonce[NONCE_BYTES_XC];
-    randombytes_buf(base_nonce, nonce_len);
-
-    // 6. Build the standalone header; it is the AAD for every chunk. Building
-    // it as its own vector (that never grows) keeps the AAD pointer stable for
-    // the whole chunk loop.
-    std::vector<unsigned char> header;
-    header.reserve(MAGIC_BYTES + CIPHER_BYTES + EPH_PUB_BYTES + nonce_len + CHUNK_LEN_BYTES);
-    header.insert(header.end(), reinterpret_cast<const unsigned char*>(PKCRYPT_MAGIC_V2),
-                  reinterpret_cast<const unsigned char*>(PKCRYPT_MAGIC_V2) + MAGIC_BYTES);
-    header.push_back(cipher);
-    header.insert(header.end(), eph_pk, eph_pk + EPH_PUB_BYTES);
-    header.insert(header.end(), base_nonce, base_nonce + nonce_len);
-    push_be32(header, static_cast<uint32_t>(chunk_len));
-    const size_t header_len = header.size();
-    const unsigned char* aad = header.data();  // header never grows -> stable
-
-    // 7. Encrypt each chunk with the header as AAD and a per-chunk nonce.
-    uint32_t index = 0;
-    size_t pos = 0;
-    std::vector<unsigned char> out;
-    out.reserve(header_len + plaintext.size() + TAG_BYTES);
-    std::vector<unsigned char> chunk_ct;
-    while (pos < plaintext.size()) {
-        size_t chunk_plain = std::min(chunk_len, plaintext.size() - pos);
-        if (index >= MAX_CHUNKS) { error = "too many chunks"; sodium_memzero(key, sizeof key); return {}; }
-        unsigned char nonce[NONCE_BYTES_XC];
-        chunk_nonce(base_nonce, nonce_len, index, nonce);
-
-        chunk_ct.resize(chunk_plain + TAG_BYTES);
-        unsigned long long ct_len = 0;
-        int rc;
-        if (cipher == CIPHER_AES) {
-            rc = crypto_aead_aes256gcm_encrypt(
-                chunk_ct.data(), &ct_len, plaintext.data() + pos,
-                static_cast<unsigned long long>(chunk_plain),
-                aad, static_cast<unsigned long long>(header_len),
-                nullptr, nonce, key);
-        } else {
-            rc = crypto_aead_xchacha20poly1305_ietf_encrypt(
-                chunk_ct.data(), &ct_len, plaintext.data() + pos,
-                static_cast<unsigned long long>(chunk_plain),
-                aad, static_cast<unsigned long long>(header_len),
-                nullptr, nonce, key);
-        }
-        if (rc != 0) { error = (cipher == CIPHER_AES) ? "AES-GCM encryption failed" : "XChaCha20 encryption failed"; sodium_memzero(key, sizeof key); return {}; }
-        out.insert(out.end(), chunk_ct.begin(), chunk_ct.end());
-        pos += chunk_plain;
-        ++index;
+    if (!derived) {
+        error = "key derivation failed";
+        return false;
     }
-    // Prepend the header.
-    out.insert(out.begin(), header.begin(), header.end());
-    sodium_memzero(key, sizeof key);
-    return out;
+
+    // 5. Random base nonce, then the header. Each chunk's AAD is
+    // header || final_flag, so aad_ is the header plus one flag byte.
+    randombytes_buf(base_nonce_, nonce_len_);
+    aad_.clear();
+    aad_.insert(aad_.end(), reinterpret_cast<const unsigned char*>(PKCRYPT_MAGIC_V2),
+                reinterpret_cast<const unsigned char*>(PKCRYPT_MAGIC_V2) + MAGIC_BYTES);
+    aad_.push_back(cipher);
+    aad_.push_back(payload_type);
+    aad_.insert(aad_.end(), eph_pk, eph_pk + EPH_PUB_BYTES);
+    aad_.insert(aad_.end(), base_nonce_, base_nonce_ + nonce_len_);
+    push_be32(aad_, static_cast<uint32_t>(chunk_len));
+    if (!out.write(aad_.data(), aad_.size(), error)) {
+        sodium_memzero(key_, sizeof key_);
+        return false;
+    }
+    aad_.push_back(FLAG_MORE);
+
+    out_ = &out;
+    pending_.clear();
+    pending_.reserve(chunk_len);
+    sealed_.resize(chunk_len + TAG_BYTES);
+    active_ = true;
+    return true;
 }
 
-std::vector<unsigned char> encrypt_bytes(
-    const std::vector<unsigned char>& plaintext,
-    const unsigned char recipient_ed25519_public[32], std::string& error) {
-    return encrypt_bytes(plaintext, recipient_ed25519_public,
-                         CIPHER_AES, DEFAULT_CHUNK_LEN, error);
+bool StreamEncryptor::write(const unsigned char* data, size_t n, std::string& error) {
+    if (!active_) {
+        error = "encryptor is not active";
+        return false;
+    }
+    while (n > 0) {
+        // A full buffer is sealed only now that more data has arrived: the
+        // chunk at the end of the input must be sealed as final instead.
+        if (pending_.size() == chunk_len_ && !seal(false, error)) return false;
+        size_t take = std::min(n, chunk_len_ - pending_.size());
+        pending_.insert(pending_.end(), data, data + take);
+        data += take;
+        n -= take;
+    }
+    return true;
 }
 
-std::vector<unsigned char> decrypt_bytes(
-    const std::vector<unsigned char>& container,
-    const unsigned char recipient_ed25519_seed[32],
-    const unsigned char recipient_ed25519_public[32], std::string& error) {
+bool StreamEncryptor::finish(std::string& error) {
+    if (!active_) {
+        error = "encryptor is not active";
+        return false;
+    }
+    bool ok = seal(true, error);
+    wipe();
+    return ok;
+}
 
-    if (container.size() < MAGIC_BYTES) { error = "not a PKCrypt file (bad header)"; return {}; }
+bool StreamEncryptor::seal(bool final, std::string& error) {
+    if (index_ >= MAX_CHUNKS) {
+        error = "too many chunks";
+        wipe();
+        return false;
+    }
+    unsigned char nonce[NONCE_BYTES_XC];
+    chunk_nonce(base_nonce_, nonce_len_, static_cast<uint32_t>(index_), nonce);
+    aad_.back() = final ? FLAG_FINAL : FLAG_MORE;
+    unsigned long long ct_len = 0;
+    if (aead_encrypt(is_aes_, sealed_.data(), &ct_len, pending_.data(), pending_.size(), aad_,
+                     nonce, key_) != 0) {
+        error = is_aes_ ? "AES-GCM encryption failed" : "XChaCha20 encryption failed";
+        wipe();
+        return false;
+    }
+    sodium_memzero(pending_.data(), pending_.size());
+    pending_.clear();
+    ++index_;
+    if (!out_->write(sealed_.data(), static_cast<size_t>(ct_len), error)) {
+        wipe();
+        return false;
+    }
+    return true;
+}
 
-    bool is_v2 = std::memcmp(container.data(), PKCRYPT_MAGIC_V2, MAGIC_BYTES) == 0;
-    bool is_v1 = std::memcmp(container.data(), PKCRYPT_MAGIC_V1, MAGIC_BYTES) == 0;
-    if (!is_v2 && !is_v1) { error = "not a PKCrypt file (bad header)"; return {}; }
+// ---------------------------------------------------------------------------
+// StreamDecryptor
+// ---------------------------------------------------------------------------
+
+StreamDecryptor::~StreamDecryptor() { wipe(); }
+
+void StreamDecryptor::wipe() {
+    sodium_memzero(key_, sizeof key_);
+    if (!plain_.empty()) sodium_memzero(plain_.data(), plain_.size());
+}
+
+bool StreamDecryptor::begin(ByteSource& in, const unsigned char recipient_ed25519_seed[32],
+                            const unsigned char recipient_ed25519_public[32],
+                            std::string& error) {
+    // magic | cipher | payload, then eph_pub | base_nonce | chunk_len.
+    unsigned char prefix[MAGIC_BYTES + CIPHER_BYTES + PAYLOAD_BYTES];
+    long long got = read_full(in, prefix, sizeof prefix, error);
+    if (got < 0) return false;
+    if (got < static_cast<long long>(MAGIC_BYTES) ||
+        std::memcmp(prefix, PKCRYPT_MAGIC_V2, MAGIC_BYTES) != 0) {
+        error = "not a PKCrypt file (bad header)";
+        return false;
+    }
+    if (got < static_cast<long long>(sizeof prefix)) {
+        error = "encrypted payload too short or corrupt";
+        return false;
+    }
+    const unsigned char cipher = prefix[MAGIC_BYTES];
+    payload_type_ = prefix[MAGIC_BYTES + CIPHER_BYTES];
+    if (cipher == CIPHER_AES) { is_aes_ = true; nonce_len_ = NONCE_BYTES_AES; }
+    else if (cipher == CIPHER_XCHACHA20) { is_aes_ = false; nonce_len_ = NONCE_BYTES_XC; }
+    else { error = "unsupported cipher"; return false; }
+    if (payload_type_ != PAYLOAD_FILE && payload_type_ != PAYLOAD_ARCHIVE) {
+        error = "unsupported payload type";
+        return false;
+    }
+
+    unsigned char rest[EPH_PUB_BYTES + NONCE_BYTES_XC + CHUNK_LEN_BYTES];
+    const size_t rest_len = EPH_PUB_BYTES + nonce_len_ + CHUNK_LEN_BYTES;
+    got = read_full(in, rest, rest_len, error);
+    if (got < 0) return false;
+    if (got < static_cast<long long>(rest_len)) {
+        error = "encrypted payload too short or corrupt";
+        return false;
+    }
+    const unsigned char* eph_pub = rest;
+    std::memcpy(base_nonce_, rest + EPH_PUB_BYTES, nonce_len_);
+    uint32_t chunk_len;
+    read_be32(rest + EPH_PUB_BYTES + nonce_len_, chunk_len);
+    if (chunk_len == 0) { error = "invalid chunk size in header"; return false; }
+    if (chunk_len > MAX_ACCEPTED_CHUNK_LEN) {
+        error = "chunk size in header too large (limit 16 MiB)";
+        return false;
+    }
+    chunk_len_ = chunk_len;
+
+    if (is_aes_ && !aes256gcm_ready(error)) return false;
 
     // Convert the recipient's Ed25519 key to the X25519 keypair.
     unsigned char recipient_x_pub[32], recipient_x_sk[32];
@@ -263,142 +371,95 @@ std::vector<unsigned char> decrypt_bytes(
     std::memcpy(recipient.public_key, recipient_ed25519_public, 32);
     std::memcpy(recipient.private_key, recipient_ed25519_seed, 32);
     recipient.has_private = true;
-    if (to_curve25519(recipient, recipient_x_pub, recipient_x_sk, error) == false) return {};
-
-    // ============================ v1 (legacy) ==============================
-    if (is_v1) {
-        if (container.size() < MAGIC_BYTES + EPH_PUB_BYTES + NONCE_BYTES_AES + TAG_BYTES) {
-            error = "encrypted payload too short or corrupt";
-            sodium_memzero(recipient_x_sk, sizeof recipient_x_sk);
-            return {};
-        }
-        const unsigned char* eph_pub = container.data() + MAGIC_BYTES;
-        const unsigned char* nonce   = container.data() + MAGIC_BYTES + EPH_PUB_BYTES;
-        const unsigned char* ct      = container.data() + MAGIC_BYTES + EPH_PUB_BYTES + NONCE_BYTES_AES;
-        size_t ct_len = container.size() - (MAGIC_BYTES + EPH_PUB_BYTES + NONCE_BYTES_AES);
-
-        unsigned char shared[32];
-        if (crypto_scalarmult(shared, recipient_x_sk, eph_pub) != 0) {
-            error = "X25519 ECDH failed";
-            sodium_memzero(recipient_x_sk, sizeof recipient_x_sk);
-            return {};
-        }
-        sodium_memzero(recipient_x_sk, sizeof recipient_x_sk);
-
-        unsigned char key[KEY_BYTES];
-        if (!derive_key(shared, eph_pub, recipient_x_pub, HKDF_INFO_V1,
-                        sizeof(HKDF_INFO_V1) - 1, key)) {
-            error = "key derivation failed";
-            sodium_memzero(shared, sizeof shared);
-            return {};
-        }
-        sodium_memzero(shared, sizeof shared);
-
-        if (!aes256gcm_ready(error)) { sodium_memzero(key, sizeof key); return {}; }
-
-        std::vector<unsigned char> pt(ct_len - TAG_BYTES);
-        unsigned long long pt_len = 0;
-        if (crypto_aead_aes256gcm_decrypt(
-                pt.data(), &pt_len, nullptr, ct, static_cast<unsigned long long>(ct_len),
-                nullptr, 0, nonce, key) != 0) {
-            sodium_memzero(key, sizeof key);
-            error = "decryption failed: file is not for this private key, or it was tampered with";
-            return {};
-        }
-        sodium_memzero(key, sizeof key);
-        pt.resize(pt_len);
-        return pt;
-    }
-
-    // ============================ v2 (current) =============================
-    size_t off = MAGIC_BYTES;
-    unsigned char cipher = container[off]; off += CIPHER_BYTES;
-    const unsigned char* eph_pub = container.data() + off; off += EPH_PUB_BYTES;
-
-    bool is_aes;
-    size_t nonce_len;
-    if (cipher == CIPHER_AES) { is_aes = true;  nonce_len = NONCE_BYTES_AES; }
-    else if (cipher == CIPHER_XCHACHA20) { is_aes = false; nonce_len = NONCE_BYTES_XC; }
-    else { error = "unsupported cipher"; sodium_memzero(recipient_x_sk, sizeof recipient_x_sk); return {}; }
-
-    if (container.size() < off + nonce_len + CHUNK_LEN_BYTES + TAG_BYTES) {
-        error = "encrypted payload too short or corrupt";
-        sodium_memzero(recipient_x_sk, sizeof recipient_x_sk);
-        return {};
-    }
-    const unsigned char* base_nonce = container.data() + off; off += nonce_len;
-
-    uint32_t chunk_len;
-    read_be32(container.data() + off, chunk_len); off += CHUNK_LEN_BYTES;
-    if (chunk_len == 0) { error = "invalid chunk size in header"; sodium_memzero(recipient_x_sk, sizeof recipient_x_sk); return {}; }
-
-    // Header = all bytes up to and including chunk_len (used as AAD).
-    std::vector<unsigned char> header(container.begin(), container.begin() + off);
-
-    if (is_aes && !aes256gcm_ready(error)) { sodium_memzero(recipient_x_sk, sizeof recipient_x_sk); return {}; }
+    if (!to_curve25519(recipient, recipient_x_pub, recipient_x_sk, error)) return false;
 
     unsigned char shared[32];
-    if (crypto_scalarmult(shared, recipient_x_sk, eph_pub) != 0) {
-        error = "X25519 ECDH failed";
-        sodium_memzero(recipient_x_sk, sizeof recipient_x_sk);
-        return {};
-    }
+    int rc = crypto_scalarmult(shared, recipient_x_sk, eph_pub);
     sodium_memzero(recipient_x_sk, sizeof recipient_x_sk);
-
-    unsigned char key[KEY_BYTES];
-    if (!derive_key(shared, eph_pub, recipient_x_pub, HKDF_INFO_V2,
-                    sizeof(HKDF_INFO_V2) - 1, key)) {
-        error = "key derivation failed";
-        sodium_memzero(shared, sizeof shared);
-        return {};
+    if (rc != 0) {
+        error = "X25519 ECDH failed";
+        return false;
     }
+    bool derived = derive_key(shared, eph_pub, recipient_x_pub, HKDF_INFO_V2,
+                              sizeof(HKDF_INFO_V2) - 1, key_);
     sodium_memzero(shared, sizeof shared);
-
-    // Decrypt chunks. Each chunk is exactly chunk_len plaintext + tag, except
-    // the final one (>= tag bytes). Cumulative sizing keeps us aligned.
-    std::vector<unsigned char> pt;
-    uint32_t index = 0;
-    size_t pos = off;
-    while (pos < container.size()) {
-        size_t remaining = container.size() - pos;
-        if (remaining < TAG_BYTES) {
-            error = "encrypted payload too short or corrupt";
-            sodium_memzero(key, sizeof key);
-            return {};
-        }
-        size_t ct_len = std::min(static_cast<size_t>(chunk_len) + TAG_BYTES, remaining);
-
-        unsigned char nonce[NONCE_BYTES_XC];
-        chunk_nonce(base_nonce, nonce_len, index, nonce);
-
-        std::vector<unsigned char> chunk_pt(ct_len - TAG_BYTES);
-        unsigned long long pt_len = 0;
-        int rc;
-        if (is_aes) {
-            rc = crypto_aead_aes256gcm_decrypt(
-                chunk_pt.data(), &pt_len, nullptr,
-                container.data() + pos, static_cast<unsigned long long>(ct_len),
-                header.data(), static_cast<unsigned long long>(header.size()),
-                nonce, key);
-        } else {
-            rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
-                chunk_pt.data(), &pt_len, nullptr,
-                container.data() + pos, static_cast<unsigned long long>(ct_len),
-                header.data(), static_cast<unsigned long long>(header.size()),
-                nonce, key);
-        }
-        if (rc != 0) {
-            sodium_memzero(key, sizeof key);
-            error = "decryption failed: file is not for this private key, or it was tampered with";
-            return {};
-        }
-        chunk_pt.resize(pt_len);
-        pt.insert(pt.end(), chunk_pt.begin(), chunk_pt.end());
-        pos += ct_len;
-        ++index;
+    if (!derived) {
+        error = "key derivation failed";
+        return false;
     }
-    sodium_memzero(key, sizeof key);
-    return pt;
+
+    aad_.assign(prefix, prefix + sizeof prefix);
+    aad_.insert(aad_.end(), rest, rest + rest_len);
+    aad_.push_back(FLAG_MORE);
+    in_ = &in;
+    index_ = 0;
+    return true;
+}
+
+bool StreamDecryptor::run(ByteSink& out, std::string& error, bool salvage) {
+    if (!in_) {
+        error = "decryptor is not active";
+        return false;
+    }
+    // Every chunk but the last is exactly one full block; the last holds the
+    // rest. A full block is only known not to be last once the next one has
+    // been read, so one block of lookahead is kept.
+    const size_t block = chunk_len_ + TAG_BYTES;
+    plain_.resize(chunk_len_ + 1);      // +1 so data() is never null
+    auto read_block = [&](std::vector<unsigned char>& buf) {
+        buf.resize(block);
+        long long got = read_full(*in_, buf.data(), block, error);
+        if (got < 0) return false;
+        buf.resize(static_cast<size_t>(got));
+        return true;
+    };
+
+    std::vector<unsigned char> cur, next;
+    bool ok = read_block(cur);
+    while (ok) {
+        if (cur.size() < block) break;                  // short: must be final
+        if (!(ok = read_block(next))) break;
+        if (next.empty()) break;                        // full block at EOF: final
+        if (!(ok = open(cur, false, out, error))) break;
+        cur.swap(next);
+    }
+    if (ok) {
+        ok = open(cur, true, out, error);
+        if (!ok && salvage && cur.size() == block) {
+            // Cut off at a chunk boundary: this chunk was sealed as non-final.
+            // Keep it if it verifies as such; the stream is still incomplete.
+            std::string ignored;
+            open(cur, false, out, ignored);
+        }
+    }
+    in_ = nullptr;
+    wipe();
+    return ok;
+}
+
+bool StreamDecryptor::open(const std::vector<unsigned char>& ct, bool final, ByteSink& out,
+                           std::string& error) {
+    if (ct.size() < TAG_BYTES) {
+        error = "encrypted payload truncated or corrupt";
+        return false;
+    }
+    if (index_ >= MAX_CHUNKS) {
+        error = "encrypted payload has too many chunks";
+        return false;
+    }
+    unsigned char nonce[NONCE_BYTES_XC];
+    chunk_nonce(base_nonce_, nonce_len_, static_cast<uint32_t>(index_), nonce);
+    aad_.back() = final ? FLAG_FINAL : FLAG_MORE;
+    unsigned long long pt_len = 0;
+    if (aead_decrypt(is_aes_, plain_.data(), &pt_len, ct.data(), ct.size(), aad_, nonce,
+                     key_) != 0) {
+        error = DECRYPT_FAILED;
+        return false;
+    }
+    ++index_;
+    bool ok = out.write(plain_.data(), static_cast<size_t>(pt_len), error);
+    sodium_memzero(plain_.data(), static_cast<size_t>(pt_len));
+    return ok;
 }
 
 } // namespace pkcrypt

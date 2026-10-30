@@ -134,6 +134,39 @@ def main() -> int:
         r = run(str(BIN), "decrypt", priv, str(junk), tmp / "g.out")
         check("C++ rejects non-PKCrypt file", r.returncode != 0)
 
+        # --- H) Chunk edge cases, both directions ----------------------------
+        # Empty, exactly two 1 MiB chunks (last chunk full), and two + a bit.
+        mib = 1024 * 1024
+        tools = {"C++": [str(BIN)], "Python": [PY, "-m", "pkcrypt_lib"]}
+        for label, data in [("empty", b""), ("2 MiB", os.urandom(2 * mib)),
+                            ("2 MiB + 5", os.urandom(2 * mib + 5))]:
+            src = tmp / f"h_{len(data)}.in"
+            src.write_bytes(data)
+            for enc_name, dec_name in [("C++", "Python"), ("Python", "C++")]:
+                tag = f"{enc_name}->{dec_name} {label}"
+                ct = tmp / f"h_{len(data)}_{enc_name}.pkcrypt"
+                r = run(*tools[enc_name], "encrypt", pub, str(src), str(ct))
+                if r.returncode != 0:
+                    check(f"{tag} round-trip", False, r.stderr)
+                    continue
+                out = tmp / f"h_{len(data)}_{enc_name}.out"
+                r = run(*tools[dec_name], "decrypt", priv, str(ct), str(out))
+                check(f"{tag} round-trip",
+                      r.returncode == 0 and out.read_bytes() == data, r.stderr)
+
+                # Dropping the final chunk leaves only valid-looking chunks;
+                # it must still be rejected, with no output file left behind.
+                if len(data) > mib:
+                    blob = ct.read_bytes()
+                    last = (len(data) - 1) % mib + 1 + 16
+                    cut = tmp / f"h_{len(data)}_{enc_name}.cut.pkcrypt"
+                    cut.write_bytes(blob[:-last])
+                    cut_out = tmp / f"h_{len(data)}_{enc_name}.cut.out"
+                    r = run(*tools[dec_name], "decrypt", priv, str(cut), str(cut_out))
+                    check(f"{tag} truncation rejected",
+                          r.returncode != 0 and not cut_out.exists(),
+                          "truncated file decrypted!")
+
     finally:
         pass  # tmp cleaned on exit by tempfile caller
 

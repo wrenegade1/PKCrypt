@@ -20,11 +20,20 @@ else
   LDFLAGS  +=
 endif
 
-SRCS = src/pkcrypt.cpp src/ssh_key.cpp src/crypto.cpp src/fileio.cpp src/base64.cpp
-HDRS = $(wildcard include/pkcrypt/*.h include/pkcrypt/*.hpp)
+SRCS = src/pkcrypt.cpp src/ssh_key.cpp src/crypto.cpp src/fileio.cpp src/base64.cpp \
+       src/crc32.cpp src/deflate.cpp src/inflate.cpp src/zip.cpp src/archive.cpp
+HDRS = $(wildcard include/pkcrypt/*.h include/pkcrypt/*.hpp src/*.h)
 OBJS = $(SRCS:.cpp=.o)
 
 BIN = pkcrypt
+
+# Test-only harness exposing the DEFLATE/CRC-32/ZIP code to the Python tests.
+# Built with AddressSanitizer + UBSan so malformed-input tests catch memory
+# errors, not just wrong answers.
+HARNESS = tests/deflate_harness
+HARNESS_SRCS = tests/deflate_harness.cpp src/crc32.cpp src/deflate.cpp src/inflate.cpp src/base64.cpp \
+               src/zip.cpp src/archive.cpp src/fileio.cpp
+SANITIZE = -fsanitize=address,undefined -fno-sanitize-recover=undefined
 
 all: $(BIN)
 
@@ -37,12 +46,22 @@ $(BIN): $(OBJS)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(HARNESS): $(HARNESS_SRCS) $(HDRS)
+	$(CXX) -std=c++17 -O1 -g -Wall -Wextra -Iinclude $(filter -I%,$(CXXFLAGS)) $(SANITIZE) \
+	    $(HARNESS_SRCS) -o $@ $(LDFLAGS) $(LDLIBS)
+
 # Build, then run BOTH test suites (Python unit tests + C++ interop).
-test: $(BIN)
+test: $(BIN) $(HARNESS)
 	python3 -m pytest tests/ -q
 	python3 tests/test_cpp_interop.py
 
-clean:
-	rm -f $(OBJS) $(BIN)
+# Opt-in large-input tests: 1 GiB of repeating patterns through every
+# encryptor/decryptor combination (set PKCRYPT_LARGE_MIB to change the size).
+test-large: $(BIN)
+	PKCRYPT_LARGE_TESTS=1 python3 -m pytest tests/test_large.py -s -q
 
-.PHONY: all clean test
+clean:
+	rm -f $(OBJS) $(BIN) $(HARNESS)
+	rm -rf $(HARNESS).dSYM
+
+.PHONY: all clean test test-large

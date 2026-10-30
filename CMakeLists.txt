@@ -39,6 +39,11 @@ set(PKCRYPT_SOURCES
   src/crypto.cpp
   src/fileio.cpp
   src/base64.cpp
+  src/crc32.cpp
+  src/deflate.cpp
+  src/inflate.cpp
+  src/zip.cpp
+  src/archive.cpp
 )
 
 # --- CLI binary ------------------------------------------------------------

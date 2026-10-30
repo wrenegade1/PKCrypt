@@ -10,7 +10,12 @@ dist/
 *.o
 src/*.o
 /pkcrypt
+/tests/deflate_harness
+/tests/deflate_harness.dSYM/
 
 
 # OS
 .DS_Store
+
+# Editor tooling (clangd index)
+.cache/

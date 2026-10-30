@@ -5,8 +5,32 @@ All notable changes to PKCrypt are documented here. This project follows
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-29
+
 ### Added
 
+- **Encrypt whole folders.** `pkcrypt encrypt <pub> <folder>` packs the folder
+  into a compressed ZIP archive inside a single `.pkcrypt`; `decrypt` recreates
+  the folder. Works in both implementations and across them.
+  - **In-house C++ ZIP and DEFLATE** (`src/zip.cpp`, `src/deflate.cpp`,
+    `src/inflate.cpp`, `src/crc32.cpp`), written from RFC 1951 and the PKWARE
+    APPNOTE with no third-party code. Compression ratio is on par with zlib's
+    default level. Python uses the standard library's `zipfile`/`zlib`.
+  - **Safe extraction** of untrusted archives in both implementations: path
+    traversal, symlinks, special files, duplicate names and overlapping entries
+    (zip bombs) are rejected; sizes and CRC-32s are enforced; free disk space is
+    checked first; output is extracted to a temp folder and renamed into place
+    only on success, never over an existing path.
+  - Symbolic links and special files in a folder are skipped with a warning.
+    Extracted files are `0600` (`0700` if executable), folders `0700`, with
+    modification times restored.
+  - **Payload type byte** in the container header (`0x00` file, `0x01` folder
+    archive), authenticated with the rest of the header, so a `.zip` encrypted
+    as a file is never auto-extracted.
+- **Verification against independent implementations**: the C++ DEFLATE is
+  tested against zlib in both directions and by differential fuzzing, and its
+  ZIP output against Python's `zipfile`, through a test harness built with
+  AddressSanitizer and UBSan.
 - Interoperable **C++ implementation** (`src/`, `include/`, `Makefile`):
   - Produces and consumes the **same file format** as the Python version, so
     the C++ and Python tools can decrypt each other's files interchangeably.
@@ -16,8 +40,54 @@ All notable changes to PKCrypt are documented here. This project follows
     written in-house, verified byte-for-byte against the reference (Python
     `base64`) over real OpenSSH keys, all input-length classes, padding
     variants, and embedded newline wrapping.
-  - `make test` runs a 9-case cross-language interop suite
+  - `make test` runs a cross-language interop suite
     (`tests/test_cpp_interop.py`).
+- **v2 container format** (`PKCRYPT\x02`) with, interoperably in both Python and
+  C++:
+  - **Chunked encryption** — plaintext is split into 1 MiB chunks, each encrypted
+    with a distinct per-chunk nonce, so the format supports arbitrarily large
+    files without a single AEAD message limit.
+  - **Authenticated header** — the fixed header (magic, cipher byte, ephemeral
+    key, base nonce, chunk size) is passed as associated data (AAD) to every
+    chunk, so any tampering with the header fails the authentication tag.
+  - **Cipher byte** selects AES-256-GCM (`0x00`) or XChaCha20-Poly1305 (`0x01`),
+    the latter as a fallback for CPUs without AES hardware acceleration
+    (C++ uses libsodium; Python binds libsodium for XChaCha20).
+  - **Truncation-resistant** — each chunk's AAD also carries a final-chunk flag,
+    so cutting the file at a chunk boundary, or appending to it, fails
+    decryption instead of silently yielding a shorter or longer plaintext.
+  - **Empty files** are encoded as one empty final chunk and round-trip in both
+    implementations.
+- **Streaming encrypt/decrypt** in both implementations: files and folders are
+  read, compressed, encrypted and written chunk by chunk, so memory use stays
+  flat regardless of size (the C++ binary peaks at a few MiB for a 300 MB file
+  or a 400 MB folder). Decrypted output is only published once every chunk
+  (including the final one) has verified.
+  - C++: `StreamEncryptor`/`StreamDecryptor`, a streaming `DeflateStream` and
+    inflater, a ZIP writer using data descriptors, and a ZIP reader working on
+    a file with positioned reads; output is written via an atomic, no-clobber
+    temp file.
+- **Chunk size limit:** decryptors reject a header `chunk_len` above 16 MiB,
+  since one chunk is buffered and the value comes from the sender.
+- **`decrypt --salvage`** in both implementations: recover what still verifies
+  from a damaged file instead of refusing it. With one bad file inside an intact
+  folder, every other file is recovered; with a damaged or truncated container,
+  every file stored entirely within the verified chunks is (found by scanning
+  the archive's local headers, since its index is at the end); a single file
+  comes back as its verified start. Only authenticated data is ever written,
+  the result goes to `<name>.partial` with exit status 3, and every safety rule
+  still applies per file.
+- **Large-input tests** (`make test-large`, opt-in): 1 GiB of deterministic
+  repeating patterns (`tests/make_test_data.py`) through every C++/Python
+  combination, as a file and as a folder, checked by SHA-256 with memory
+  ceilings and a corrupted-copy rejection check. Multi-file folders are also
+  tested across languages with container damage and per-file corruption.
+- **Tamper-resistance test suite** (`tests/test_integrity.py`): verifies at
+  the library level, across both ciphers and both payload types, that
+  reordering, replaying, dropping, truncating, splicing, or bit-flipping any
+  chunk, and editing any single header byte, is rejected - the core
+  integrity guarantee. Added after an adversarial testing pass that also
+  confirmed the decrypter leaves no output on any rejected input.
 
 ### Changed
 
@@ -31,6 +101,10 @@ All notable changes to PKCrypt are documented here. This project follows
 - Added author attribution (Warren Zajac) to file headers, comments, and pyproject
   metadata across the codebase.
 - Added the `LICENSE` file (Apache License 2.0).
+- **Pure-Python private-key conversion** — the Ed25519 seed → X25519 private key
+  (SHA-512 + bit-clamping) no longer requires libsodium; the public-key
+  conversion still uses libsodium, now located robustly via
+  `ctypes.util.find_library("sodium")`.
 
 ### Security
 
@@ -44,31 +118,37 @@ All notable changes to PKCrypt are documented here. This project follows
 - **Passphrase-key guidance** — the README and C++ `--help` no longer advise
   stripping a key's passphrase (`ssh-keygen -p -f ... -N ""`). They now point
   passphrase-protected-key users to the Python CLI's `decrypt --passphrase`.
-
-### Added
-
-- **v2 container format** (`PKCRYPT\x02`) with, interoperably in both Python and
-  C++:
-  - **Chunked encryption** — plaintext is split into 1 MiB chunks, each encrypted
-    with a distinct per-chunk nonce, so the format supports arbitrarily large
-    files without a single AEAD message limit.
-  - **Authenticated header** — the fixed header (magic, cipher byte, ephemeral
-    key, base nonce, chunk size) is passed as associated data (AAD) to every
-    chunk, so any tampering with the header fails the authentication tag.
-  - **Cipher byte** selects AES-256-GCM (`0x00`) or XChaCha20-Poly1305 (`0x01`),
-    the latter as a fallback for CPUs without AES hardware acceleration
-    (C++ uses libsodium; Python binds libsodium for XChaCha20).
-  - **Backwards compatible** — v1 (`PKCRYPT\x01`) containers remain readable.
-- **Pure-Python private-key conversion** — the Ed25519 seed → X25519 private key
-  (SHA-512 + bit-clamping) no longer requires libsodium; the public-key
-  conversion still uses libsodium, now located robustly via
-  `ctypes.util.find_library("sodium")`.
 - **C++ private-key validation** — the parser now confirms the redundant public
   key stored in an OpenSSH private key matches the seed, and wipes the raw seed
   buffers from memory after parsing.
 
+### Removed
+
+- **Breaking:** v1 (`PKCRYPT\x01`) containers written by 1.0.0 can no longer
+  be decrypted, by either implementation.
+
 ### Fixed
 
+- **Terminal-escape injection via archive filenames** (both implementations):
+  a member name inside an encrypted folder is attacker-controlled, and names
+  were printed to the terminal (errors, skipped/lost reports) without
+  sanitizing, so a crafted `.pkcrypt` could emit terminal escape sequences when
+  decrypted. Two layers of defense now: member names containing C0 control
+  bytes or DEL are **rejected** outright (archives are refused on extract and
+  never produced on encrypt, in both implementations), and every name/message
+  is additionally **escaped at display time** (control bytes shown as `\xHH`),
+  leaving UTF-8 filenames readable. Found by the C++ CTF fuzzing pass; covered
+  by new tests in `tests/test_archive.py`.
+- **base64 decoder undefined behavior** (C++): the 6-bits-per-character
+  accumulator was a signed `int` that was shifted left and never masked, so it
+  overflowed after a few non-zero characters - undefined behavior on every SSH
+  key the C++ tool parsed, benign only by chance at `-O2`. It now uses unsigned
+  arithmetic and masks to the bits actually read; output is unchanged. Found by
+  fuzzing the CLI under UBSan; base64 is now covered by the sanitized test
+  harness (`tests/test_base64.py`), checked against Python's `base64`.
+- **Exit codes** now match the documented scheme in both implementations:
+  `1` failed, `2` usage or unreadable key (C++ returned 1), `3` partial result.
+  Python returned 2 for decryption failures; it now returns 1.
 - **Python decrypt** now rejects truncated/too-short containers with a clear
   "too short" error instead of a less helpful one.
 - **Unified test command** — `make test` (and CMake `check`) now run BOTH the

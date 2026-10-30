@@ -34,39 +34,101 @@ def write_bytes(path: str | Path, data: bytes) -> None:
     check-and-create race in the old code is closed). The temp file is removed
     on any failure so a crash never leaves a partial file behind.
     """
-    dest = Path(path)
-    dest_dir = dest.parent
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    with AtomicOutput(path, must_not_exist=True) as out:
+        out.write(data)
 
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{dest.name}.", suffix=".tmp", dir=str(dest_dir)
-    )
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.chmod(tmp, _OUTPUT_MODE)
-        # Atomic no-clobber publish: hard-link fails if `dest` already exists.
-        try:
-            os.link(tmp, dest)
-        except FileExistsError:
+
+class AtomicOutput:
+    """A streaming, atomic, no-clobber writer for PKCrypt outputs.
+
+    Provides a file-like ``write`` for writing incrementally (so large files
+    never need to live in memory), while preserving all three guarantees of
+    :func:`write_bytes`:
+
+    * restrictive ``0600`` permissions,
+    * the destination is never silently overwritten: the temp file is
+      hard-linked into place only if the destination does not yet exist,
+    * a crash never leaves a partial file at the destination (data goes to a
+      temp file first).
+
+    Use it as a context manager; on normal exit it finalizes (fsync, then the
+    atomic no-clobber link). On an exception inside the block, the temp file is
+    removed and the destination is untouched.
+    """
+
+    def __init__(self, path: str | Path, must_not_exist: bool = True):
+        self._dest = Path(path)
+        dest_dir = self._dest.parent
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        if must_not_exist and self._dest.exists():
             raise FileExistsError(
-                f"refusing to overwrite existing file: {dest}"
-            ) from None
-    finally:
-        # Remove the temp file whether or not we succeeded (mkdirstemp leaves it
-        # behind on early failure; a successful link also must not leave it).
+                f"refusing to overwrite existing file: {self._dest}"
+            )
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self._dest.name}.", suffix=".tmp", dir=str(dest_dir)
+        )
+        self._tmp = Path(tmp_name)
+        os.chmod(self._tmp, _OUTPUT_MODE)
+        self._fh = os.fdopen(fd, "wb")
+        self._committed = False
+
+    def write(self, data: bytes) -> None:
+        self._fh.write(data)
+
+    def retarget(self, path: str | Path) -> None:
+        """Publish to ``path`` instead of the path given at creation (same
+        no-clobber rule; it must be in the same directory)."""
+        self._dest = Path(path)
+
+    def close(self) -> None:
+        """Finalize: flush + fsync, then atomic no-clobber link into place."""
+        if self._committed:
+            return
         try:
-            tmp.unlink(missing_ok=True)
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+            self._fh.close()
+            try:
+                os.link(self._tmp, self._dest)
+            except FileExistsError:
+                raise FileExistsError(
+                    f"refusing to overwrite existing file: {self._dest}"
+                ) from None
+            self._committed = True
+        finally:
+            # Always remove the temp file (a successful link leaves it as an
+            # extra link; either way it is no longer needed).
+            try:
+                self._tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def abort(self) -> None:
+        """Discard the pending output: close and remove the temp file."""
+        try:
+            self._fh.close()
         except OSError:
             pass
+        try:
+            self._tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._committed = True  # prevent close() from re-running
+
+    def __enter__(self) -> "AtomicOutput":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            self.abort()
+        else:
+            self.close()
 
 
 def encrypted_output_path(input_path: str) -> str:
-    """Default output path when encrypting: ``<input>.pkcrypt``."""
-    return input_path + ".pkcrypt"
+    """Default output path when encrypting: ``<input>.pkcrypt`` (for a
+    folder ``photos/``, ``photos.pkcrypt``)."""
+    return (input_path.rstrip("/") or input_path) + ".pkcrypt"
 
 
 def decrypted_output_path(input_path: str) -> str:
@@ -77,7 +139,12 @@ def decrypted_output_path(input_path: str) -> str:
         cand = Path(str(p)[: -len(".pkcrypt")])
         if cand.name and not cand.exists():
             return str(cand)
-    base = input_path + ".decrypted"
+    return unused_path(input_path + ".decrypted")
+
+
+def unused_path(base: str) -> str:
+    """``base`` if nothing exists there, else the first free of base.1,
+    base.2, ..."""
     cand = Path(base)
     i = 1
     while cand.exists():

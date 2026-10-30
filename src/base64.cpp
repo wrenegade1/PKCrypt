@@ -47,15 +47,18 @@ bool base64_decode(const std::string& in, std::vector<unsigned char>& out) {
     std::vector<unsigned char> result;
     result.reserve((in.size() / 4) * 3);
 
-    int val = 0;   // bit accumulator (6 bits per char)
-    int valb = -8; // bits available in the accumulator below 'val'
+    // Unsigned so the << 6 that shifts old bits past the top is well-defined
+    // modular wrap, not signed-overflow UB. Only the low `valb + 8` bits are
+    // ever read, so the mask keeps `val` small without changing any output.
+    unsigned int val = 0; // bit accumulator (6 bits per char)
+    int valb = -8;        // bits available in the accumulator below 'val'
 
     for (unsigned char c : in) {
         if (c == '=') break;                  // padding: stop here
         if (is_whitespace(static_cast<char>(c))) continue;
         signed char d = table[c];
         if (d < 0) return false;              // invalid character
-        val = (val << 6) + d;
+        val = ((val << 6) | static_cast<unsigned int>(d)) & 0x3FFFFu;
         valb += 6;
         if (valb >= 0) {
             result.push_back(static_cast<unsigned char>((val >> valb) & 0xFF));
