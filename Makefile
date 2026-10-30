@@ -37,8 +37,9 @@ $(BIN): $(OBJS)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Build, then run the cross-language interop + unit test script.
+# Build, then run BOTH test suites (Python unit tests + C++ interop).
 test: $(BIN)
+	python3 -m pytest tests/ -q
 	python3 tests/test_cpp_interop.py
 
 clean:

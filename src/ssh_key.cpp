@@ -18,6 +18,8 @@
 // Own base64 decoder (see base64.cpp), verified against the reference.
 #include "pkcrypt/base64.h"
 
+#include <sodium.h>
+
 namespace pkcrypt {
 
 namespace {
@@ -229,9 +231,21 @@ std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
                 std::to_string(priv_raw.size()) + ")";
         return std::nullopt;
     }
-    std::memcpy(key.private_key, priv_raw.data(), 32);
 
+    // Consistency check: the redundant public-key copy stored alongside the
+    // seed must match the embedded public key. This confirms the key file is
+    // internally consistent (the seed belongs to this public key).
+    if (std::memcmp(priv_raw.data() + 32, embedded_pub.data(), 32) != 0) {
+        error = "private key is inconsistent (seed does not match public key)";
+        return std::nullopt;
+    }
+
+    std::memcpy(key.private_key, priv_raw.data(), 32);
     key.has_private = true;
+
+    // Wipe the raw seed/key material from temporary buffers before returning.
+    sodium_memzero(priv_raw.data(), priv_raw.size());
+    sodium_memzero(raw.data(), raw.size());
     return key;
 }
 

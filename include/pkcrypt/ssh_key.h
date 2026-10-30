@@ -30,8 +30,10 @@ std::optional<Ed25519Key> parse_ssh_public_key_file(const std::string& path,
 // Ed25519 key material. Both public and private portions are populated.
 //
 // NOTE: Password-protected keys ("aes256-ctr" cipher) are NOT supported directly.
-// The OpenSSH KDF (bcrypt_pbkdf) is intentionally out of scope; such keys should
-// first be decrypted with `ssh-keygen -p -f key -N ""`, or kept unencrypted.
+// The OpenSSH KDF (bcrypt_pbkdf) is intentionally out of scope. For a
+// passphrase-protected key, use the Python CLI's `decrypt --passphrase`; do not
+// empty the key's passphrase (that weakens your SSH key) just to use the C++
+// binary.
 std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
                                                       std::string& error);
 

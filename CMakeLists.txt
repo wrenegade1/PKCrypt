@@ -50,9 +50,14 @@ target_include_directories(pkcrypt PRIVATE
 target_link_libraries(pkcrypt PRIVATE ${SODIUM_LIBRARY})
 
 # --- Tests -----------------------------------------------------------------
-# Mirrors `make test`: build the binary, then run the cross-language interop
-# + unit-test script with Python.
+# Mirrors `make test`: build the binary, then run BOTH the Python unit tests
+# and the cross-language C++ interop suite.
 enable_testing()
+add_test(
+  NAME python_unit
+  COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}
+          python3 -m pytest ${CMAKE_CURRENT_SOURCE_DIR}/tests/ -q
+)
 add_test(
   NAME cpp_interop
   COMMAND ${CMAKE_COMMAND} -E env PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}

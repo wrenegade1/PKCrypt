@@ -45,6 +45,38 @@ All notable changes to PKCrypt are documented here. This project follows
   stripping a key's passphrase (`ssh-keygen -p -f ... -N ""`). They now point
   passphrase-protected-key users to the Python CLI's `decrypt --passphrase`.
 
+### Added
+
+- **v2 container format** (`PKCRYPT\x02`) with, interoperably in both Python and
+  C++:
+  - **Chunked encryption** — plaintext is split into 1 MiB chunks, each encrypted
+    with a distinct per-chunk nonce, so the format supports arbitrarily large
+    files without a single AEAD message limit.
+  - **Authenticated header** — the fixed header (magic, cipher byte, ephemeral
+    key, base nonce, chunk size) is passed as associated data (AAD) to every
+    chunk, so any tampering with the header fails the authentication tag.
+  - **Cipher byte** selects AES-256-GCM (`0x00`) or XChaCha20-Poly1305 (`0x01`),
+    the latter as a fallback for CPUs without AES hardware acceleration
+    (C++ uses libsodium; Python binds libsodium for XChaCha20).
+  - **Backwards compatible** — v1 (`PKCRYPT\x01`) containers remain readable.
+- **Pure-Python private-key conversion** — the Ed25519 seed → X25519 private key
+  (SHA-512 + bit-clamping) no longer requires libsodium; the public-key
+  conversion still uses libsodium, now located robustly via
+  `ctypes.util.find_library("sodium")`.
+- **C++ private-key validation** — the parser now confirms the redundant public
+  key stored in an OpenSSH private key matches the seed, and wipes the raw seed
+  buffers from memory after parsing.
+
+### Fixed
+
+- **Python decrypt** now rejects truncated/too-short containers with a clear
+  "too short" error instead of a less helpful one.
+- **Unified test command** — `make test` (and CMake `check`) now run BOTH the
+  Python unit suite and the C++ interop suite in one command.
+- **README threat model** now explicitly states that sender identity is not
+  verified (anyone with your public key can encrypt to you; signing is future
+  work).
+
 ## [1.0.0] - 2026-10-28
 
 ### Added

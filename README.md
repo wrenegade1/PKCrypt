@@ -307,22 +307,32 @@ The `.pkcrypt` file is a single self-contained container. The recipient needs no
 but their private key to open it.
 
 ```
- Format version 1
- ┌────────────────┬────────────────────┬──────────────────────┬───────────────────────────┐
- │ magic (8 B)    │ ephemeral pub (32) │ nonce (12 B)         │ ciphertext + GCM tag (n B) │
- │ "PKCRYPT\x01"  │ sender's X25519 pk │ AES-256-GCM nonce    │ encrypted file + 16-byte   │
- │                │                    │                      │ authentication tag         │
- └────────────────┴────────────────────┴──────────────────────┴───────────────────────────┘
+ Format version 2
+ ┌──────────┬────────┬────────────────────┬───────────────────────┬───────────────────────────────┐
+ │ magic(8) │ cipher │ ephemeral pub(32)  │ base nonce (12|24 B)  │ chunk_len (4 B, big-endian)  │
+ │"PKCRYPT\x02"│  1 B  │ sender's X25519 pk │ AES-GCM / XChaCha20   │ max plaintext bytes / chunk  │
+ └──────────┴────────┴────────────────────┴───────────────────────┴───────────────────────────────┘
+    header (passed as AAD to every chunk)                    payload: fixed-size AEAD chunks
 ```
 
 | Field | Size | Description |
 |-------|------|-------------|
-| `magic` | 8 B | ASCII `PKCRYPT` followed by `0x01` (format version). |
+| `magic` | 8 B | ASCII `PKCRYPT` followed by `0x02` (format version). |
+| `cipher` | 1 B | `0x00` = AES-256-GCM, `0x01` = XChaCha20-Poly1305. |
 | `ephemeral public key` | 32 B | The sender's one-time X25519 public key. |
-| `nonce` | 12 B | Random, unique AES-GCM nonce (never reused). |
-| `ciphertext` | n B | AES-256-GCM ciphertext, including the 16-byte tag. |
+| `base nonce` | 12–24 B | Random AEAD base nonce (12 for AES-GCM, 24 for XChaCha20). |
+| `chunk_len` | 4 B | Max plaintext bytes per chunk (default 1 MiB), big-endian. |
+| payload | n B | Each chunk is `chunk_len` plaintext bytes (last may be short) + a 16-byte tag. |
 
-Total overhead over plaintext is a constant **68 bytes** (8 + 32 + 12 + 16).
+The plaintext is split into `chunk_len`-byte chunks. Each chunk is encrypted with the
+**same** key but a **different** nonce: chunk *i*'s nonce is the base nonce with its final
+4 bytes set to the big-endian chunk index. The fixed header is passed as **associated
+data** to every chunk, so altering the magic, cipher byte, ephemeral key, base nonce, or
+chunk size fails the authentication tag. `0x01` (XChaCha20-Poly1305) is the fallback
+cipher for CPUs without AES hardware acceleration.
+
+**v1 compatibility:** legacy `PKCRYPT\x01` files (one whole-file AES-256-GCM message) are
+still readable by both implementations; new files are always written as v2.
 
 The format is identical between the Python and C++ implementations, which is what makes
 them fully interoperable.
@@ -358,8 +368,11 @@ This section states honestly what PKCrypt does and does not guarantee.
   (past, present, future) as long as they hold the private key — by design.
 - **Denial of service.** Anyone with the public key can encrypt files *for* the
   recipient; nothing prevents spam or huge files.
-- **Non-repudiation of sender.** PKCrypt authenticates the *ciphertext* but does not
-  prove *who* encrypted it. It is not a digital signature.
+- **Sender identity is not verified.** Anyone who knows your *public* key can
+  encrypt a file *to* you, and nothing in the format proves who sent it — PKCrypt
+  authenticates the ciphertext but not the sender. This is a deliberate property
+  of the public-key model. Signing the plaintext with the sender's key (as
+  sketched in the Roadmap as "affine signing") would be optional future work.
 
 ### Cryptography hygiene
 
