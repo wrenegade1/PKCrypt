@@ -5,6 +5,8 @@
 Encrypt a file so that **only the holder of a specific Ed25519 SSH private key** can
 decrypt it — using the same public / private key model as SSH.
 
+[![CI](https://github.com/wrenegade1/PKCrypt/actions/workflows/ci.yml/badge.svg)](https://github.com/wrenegade1/PKCrypt/actions/workflows/ci.yml)
+
 ```
   SENDER (any machine)                  RECIPIENT (any machine)
   ─────────────────────                 ─────────────────────────
@@ -24,7 +26,7 @@ decrypt it — using the same public / private key model as SSH.
 ## Table of contents
 
 - [Highlights](#highlights)
-- [Why it matters](#why-it-matters)
+- [Background](#background)
 - [Quick start](#quick-start)
 - [Installation](#installation)
   - [Python implementation](#python-implementation)
@@ -69,7 +71,7 @@ decrypt it — using the same public / private key model as SSH.
 
 ---
 
-## Why it matters
+## Background
 
 Traditional approaches to sending someone a secret file have real weaknesses:
 
