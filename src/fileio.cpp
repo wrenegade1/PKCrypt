@@ -10,7 +10,24 @@
 #include <fstream>
 #include <sys/stat.h>
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+
 namespace pkcrypt {
+
+namespace {
+// Return the directory portion of `path` (empty if none). Used so the temp file
+// lives in the same directory as the destination (required for atomic link).
+std::string parent_dir(const std::string& path) {
+    std::string::size_type pos = path.find_last_of('/');
+    if (pos == std::string::npos) return ".";
+    if (pos == 0) return "/";
+    return path.substr(0, pos);
+}
+} // namespace
 
 bool read_file(const std::string& path, std::vector<unsigned char>& out,
                std::string& error) {
@@ -29,14 +46,57 @@ bool read_file(const std::string& path, std::vector<unsigned char>& out,
 
 bool write_file(const std::string& path, const unsigned char* data, size_t len,
                 std::string& error) {
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (!f.is_open()) { error = "cannot write file: " + path; return false; }
-    if (len > 0 && !f.write(reinterpret_cast<const char*>(data),
-                            static_cast<std::streamsize>(len))) {
-        error = "write error: " + path;
-        return false;
-    }
-    return true;
+    // Refuse to overwrite an existing file (matches the "never overwrites"
+    // contract) and write atomically + with 0600 perms.
+    const std::string dir = parent_dir(path);
+
+    // mkstemp creates a 0600 file with a unique name in the same directory.
+    std::string tmpl = dir + "/.pkcrypt-XXXXXX";
+    std::vector<char> tbuf(tmpl.begin(), tmpl.end());
+    tbuf.push_back('\0');
+    int fd = ::mkstemp(tbuf.data());
+    if (fd < 0) { error = "cannot create temp file in " + dir; return false; }
+    const std::string tmp(tbuf.data());
+
+    bool ok = false;
+    do {
+        // Write the full buffer. Handle short writes (EINTR / partial I/O).
+        size_t written = 0;
+        while (written < len) {
+            ssize_t n = ::write(fd, data + written, len - written);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                error = "write error: " + path;
+                break;
+            }
+            written += static_cast<size_t>(n);
+        }
+        if (written < len) break;  // a write error already set `error`
+
+        if (::fsync(fd) != 0) { error = "fsync failed: " + path; break; }
+        ::close(fd); fd = -1;
+
+        // Restrictive perms on a fresh file: mkstemp already gives 0600, but
+        // set it explicitly in case umask/tooling relaxed it.
+        ::chmod(tmp.c_str(), S_IRUSR | S_IWUSR);
+
+        // Atomic no-clobber publish: link() fails if `path` already exists, so
+        // the destination is never silently overwritten and never half-written.
+        if (::link(tmp.c_str(), path.c_str()) != 0) {
+            if (errno == EEXIST) {
+                error = "refusing to overwrite existing file: " + path;
+            } else {
+                error = "cannot link output into place: " + path;
+            }
+            break;
+        }
+        ::unlink(tmp.c_str());
+        ok = true;
+    } while (false);
+
+    if (fd >= 0) ::close(fd);
+    if (!ok) ::unlink(tmp.c_str());  // never leave a partial temp behind
+    return ok;
 }
 
 static bool file_exists(const std::string& path) {

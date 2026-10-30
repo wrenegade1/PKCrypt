@@ -32,6 +32,19 @@ All notable changes to PKCrypt are documented here. This project follows
   metadata across the codebase.
 - Added the `LICENSE` file (Apache License 2.0).
 
+### Security
+
+- **File permissions** — all output files (encrypted containers and decrypted
+  plaintext) are now written with restrictive `0600` permissions in both the
+  Python and C++ implementations, so decrypted plaintext is never world-readable.
+- **No silent overwrite / atomic writes** — writing to an existing output path is
+  refused rather than silently overwriting it, and writes go to a temp file that
+  is atomically linked into place, so a crash can never leave a half-written or
+  partial file. Applies to both Python and C++.
+- **Passphrase-key guidance** — the README and C++ `--help` no longer advise
+  stripping a key's passphrase (`ssh-keygen -p -f ... -N ""`). They now point
+  passphrase-protected-key users to the Python CLI's `decrypt --passphrase`.
+
 ## [1.0.0] - 2026-10-28
 
 ### Added

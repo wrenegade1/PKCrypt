@@ -37,9 +37,10 @@ void usage(const char* prog) {
         << "  # Alice decrypts it on her Mac using her private key:\n"
         << "  " << prog << " decrypt ~/.ssh/id_ed25519 secrets.tgz.pkcrypt\n\n"
         << "NOTES\n"
-        << "  - Private keys must be unencrypted (no passphrase). If yours is\n"
-        << "    protected, decrypt it once first:\n"
-        << "        ssh-keygen -p -f ~/.ssh/id_ed25519 -N \"\"\n"
+        << "  - This (C++) binary supports unencrypted private keys only.\n"
+        << "  - For a passphrase-protected key, use the Python CLI:\n"
+        << "        python3 -m pkcrypt_lib decrypt --passphrase <key> <file>\n"
+        << "    Do not empty your key's passphrase just to use the C++ binary.\n"
         << "  - Encrypting needs only the recipient's PUBLIC key. No secret\n"
         << "    material ever leaves your machine when encrypting.\n";
 }

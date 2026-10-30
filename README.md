@@ -238,11 +238,10 @@ Exit codes: `0` success, `1` runtime/security error, `2` usage/key-parse error.
 - The recipient's key must be an **Ed25519** SSH key (the modern
   `ssh-keygen -t ed25519`). RSA, ECDSA, Ed448, etc. are rejected with a clear message.
 - **Python** supports passphrase-protected private keys via `decrypt --passphrase`.
-- **C++** supports unencrypted private keys only. To use a protected key with the C++
-  binary, decrypt it once first:
-  ```bash
-  ssh-keygen -p -f ~/.ssh/id_ed25519 -N ""
-  ```
+- **C++** supports unencrypted private keys only. For a passphrase-protected key,
+  **use the Python CLI and `decrypt --passphrase`** rather than removing the
+  passphrase from your SSH key (emptying a key's passphrase weakens it and should
+  be avoided on a security tool).
 
 ---
 
@@ -443,11 +442,10 @@ ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
 ```
 
 ### `error: encrypted/passphrase-protected private keys are not supported`
-(Common with the C++ binary.) The private key has a passphrase. Either use the Python
-implementation with `--passphrase`, or remove the passphrase for this key once:
-```bash
-ssh-keygen -p -f ~/.ssh/id_ed25519 -N ""
-```
+(Common with the C++ binary.) The private key has a passphrase. Use the **Python**
+implementation with `decrypt --passphrase` instead. Do **not** empty the key's
+passphrase (for example with `ssh-keygen -p -f ~/.ssh/id_ed25519 -N ""`) just to
+use the C++ binary — that weakens your SSH key.
 
 ### `import error: libsodium is required ...`
 (Python, at import time.) Install libsodium:

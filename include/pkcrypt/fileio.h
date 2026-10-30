@@ -16,7 +16,10 @@ namespace pkcrypt {
 bool read_file(const std::string& path, std::vector<unsigned char>& out,
                std::string& error);
 
-// Write bytes to a file (truncating any existing content).
+// Write bytes to a file atomically with 0600 permissions, refusing to
+// overwrite an existing file: data goes to a temp file in the same directory,
+// then is linked into place (link fails if the destination exists, so a crash
+// never leaves a partial file and an existing output is never clobbered).
 // Returns false and sets `error` on failure.
 bool write_file(const std::string& path, const unsigned char* data, size_t len,
                 std::string& error);
