@@ -16,6 +16,9 @@ dependencies = [
     "cryptography>=41",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.scripts]
 pkcrypt = "pkcrypt_lib.cli:main"
 
