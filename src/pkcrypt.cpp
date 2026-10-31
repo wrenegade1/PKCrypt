@@ -42,6 +42,7 @@ void usage(const char* prog) {
         << "USAGE\n"
         << "  " << prog << " encrypt <recipient_pubkey> <file|folder> [out.pkcrypt]\n"
         << "  " << prog << " decrypt [--salvage] <private_key> <file.pkcrypt> [out]\n"
+        << "  " << prog << " decrypt --passphrase [--salvage] <private_key> <file.pkcrypt> [out]\n"
         << "  " << prog << " version\n\n"
         << "EXAMPLES\n"
         << "  # Encrypt a file for someone using only their public key:\n"
@@ -62,10 +63,12 @@ void usage(const char* prog) {
         << "  0 success   1 failed (nothing written)   2 usage or key error\n"
         << "  3 partial result (--salvage)\n\n"
         << "NOTES\n"
-        << "  - This (C++) binary supports unencrypted private keys only.\n"
-        << "  - For a passphrase-protected key, use the Python CLI:\n"
+        << "  - Passphrase-protected private keys are supported: pass --passphrase to be\n"
+        << "    prompted for the passphrase at a terminal (the passphrase is never echoed\n"
+        << "    and never stored). Without it, an unencrypted key is used as-is.\n"
+        << "  - For a passphrase-protected key with the Python CLI:\n"
         << "        python3 -m pkcrypt_lib decrypt --passphrase <key> <file>\n"
-        << "    Do not empty your key's passphrase just to use the C++ binary.\n"
+        << "    Do not empty your key's passphrase just to use either tool.\n"
         << "  - Encrypting needs only the recipient's PUBLIC key. No secret\n"
         << "    material ever leaves your machine when encrypting.\n";
 }
@@ -191,8 +194,12 @@ int cmd_decrypt(std::vector<std::string> args) {
     const auto flag = std::find(args.begin(), args.end(), "--salvage");
     const bool salvage = flag != args.end();
     if (salvage) args.erase(flag);
+    const auto flagp = std::find(args.begin(), args.end(), "--passphrase");
+    const bool want_pass = flagp != args.end();
+    if (want_pass) args.erase(flagp);
     if (args.size() < 2) {
-        std::cerr << "usage: pkcrypt decrypt [--salvage] <private_key> <file.pkcrypt> [out]\n";
+        std::cerr << "usage: pkcrypt decrypt [--salvage] [--passphrase] "
+                     "<private_key> <file.pkcrypt> [out]\n";
         return RC_USAGE;
     }
     std::string priv_path = args[0], in_path = args[1];
@@ -203,11 +210,25 @@ int cmd_decrypt(std::vector<std::string> args) {
         explicit_out ? out_path : unused_path(strip_slashes(out_path) + ".partial");
 
     std::string error;
-    auto key = parse_ssh_private_key_file(priv_path, error);
+    // If a passphrase is wanted, prompt for it at the terminal (no echo).
+    // The passphrase is only used to unlock the private key and is not stored.
+    const char* passphrase = nullptr;
+    std::string pass_buf;
+    if (want_pass) {
+        const char* p = getpass("Enter passphrase for the private key: ");
+        if (p == nullptr) {
+            std::cerr << "error: failed to read passphrase from terminal\n";
+            return RC_USAGE;
+        }
+        pass_buf = p;
+        passphrase = pass_buf.c_str();
+    }
+    auto key = parse_ssh_private_key_file(priv_path, error, passphrase);
     if (!key) {
         std::cerr << "error: " << display_safe(error) << "\n";
         return RC_USAGE;
     }
+    if (!pass_buf.empty()) sodium_memzero(pass_buf.data(), pass_buf.size());
 
     int in_fd = ::open(in_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (in_fd < 0) {

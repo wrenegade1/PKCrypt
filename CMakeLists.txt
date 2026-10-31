@@ -44,6 +44,8 @@ set(PKCRYPT_SOURCES
   src/inflate.cpp
   src/zip.cpp
   src/archive.cpp
+  src/bcrypt_pbkdf.cpp
+  src/aes_ctr.cpp
 )
 
 # --- CLI binary ------------------------------------------------------------
@@ -53,6 +55,19 @@ target_include_directories(pkcrypt PRIVATE
   ${SODIUM_INCLUDE_DIR}
 )
 target_link_libraries(pkcrypt PRIVATE ${SODIUM_LIBRARY})
+
+# Optional OpenSSL: when found, use it for AES-CTR (passphrase-protected key
+# decryption). Otherwise a self-contained AES fallback is compiled in, so the
+# binary still builds and works without OpenSSL.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+  target_compile_definitions(pkcrypt PRIVATE PKCRYPT_HAS_OPENSSL)
+  target_include_directories(pkcrypt PRIVATE ${OPENSSL_INCLUDE_DIR})
+  target_link_libraries(pkcrypt PRIVATE OpenSSL::Crypto)
+  message(STATUS "PKCrypt: OpenSSL found - using libcrypto for AES-CTR")
+else()
+  message(STATUS "PKCrypt: OpenSSL not found - using in-house AES-CTR fallback")
+endif()
 
 # --- Tests -----------------------------------------------------------------
 # Mirrors `make test`: build the binary, then run BOTH the Python unit tests

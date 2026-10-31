@@ -12,6 +12,8 @@ src/*.o
 /pkcrypt
 /tests/deflate_harness
 /tests/deflate_harness.dSYM/
+/tests/ssh_harness
+/tests/ssh_harness.dSYM/
 
 
 # OS

@@ -25,17 +25,18 @@ struct Ed25519Key {
 std::optional<Ed25519Key> parse_ssh_public_key_file(const std::string& path,
                                                      std::string& error);
 
-// Parse an unencrypted OpenSSH private key file ("openssh-key-v1" format, the
-// default produced by `ssh-keygen -t ed25519` without a passphrase) into raw
-// Ed25519 key material. Both public and private portions are populated.
+// Parse an OpenSSH private key file ("openssh-key-v1" format, the default
+// produced by `ssh-keygen -t ed25519`) into raw Ed25519 key material. Both
+// public and private portions are populated.
 //
-// NOTE: Password-protected keys ("aes256-ctr" cipher) are NOT supported directly.
-// The OpenSSH KDF (bcrypt_pbkdf) is intentionally out of scope. For a
-// passphrase-protected key, use the Python CLI's `decrypt --passphrase`; do not
-// empty the key's passphrase (that weakens your SSH key) just to use the C++
-// binary.
+// The key may be protected by a passphrase (encrypted with aes128/192/256-ctr
+// or chacha20-poly1305 using OpenSSH's bcrypt_pbkdf KDF). If `passphrase` is
+// non-null it is used to decrypt such a key; if it is null and the key is
+// encrypted, the key is rejected with an error. Both public and private
+// portions are populated.
 std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
-                                                      std::string& error);
+                                                     std::string& error,
+                                                     const char* passphrase = nullptr);
 
 } // namespace pkcrypt
 

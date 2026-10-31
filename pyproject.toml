@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pkcrypt"
-version = "2.0.0"
+version = "2.1.0"
 description = "Encrypt files so only the holder of an Ed25519 SSH private key can decrypt them."
 readme = "README.md"
 requires-python = ">=3.9"

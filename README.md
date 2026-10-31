@@ -236,7 +236,7 @@ Decrypt-only options:
 | Flag | Meaning |
 |------|---------|
 | `decrypt <priv> <file> [out]` | Third positional arg overrides the output path. |
-| `--passphrase` | Prompt for a passphrase-protected private key (Python only). |
+| `--passphrase` | Prompt for a passphrase to unlock a passphrase-protected private key. |
 | `--salvage` | Recover what still verifies from a damaged file instead of refusing it (see below). |
 
 Exit codes (the same in both implementations):
@@ -324,10 +324,11 @@ pkcrypt decrypt --salvage ~/.ssh/id_ed25519 photos.pkcrypt
 - The recipient's key must be an **Ed25519** SSH key (the modern
   `ssh-keygen -t ed25519`). RSA, ECDSA, Ed448, etc. are rejected with a clear message.
 - **Python** supports passphrase-protected private keys via `decrypt --passphrase`.
-- **C++** supports unencrypted private keys only. For a passphrase-protected key,
-  **use the Python CLI and `decrypt --passphrase`** rather than removing the
-  passphrase from your SSH key (emptying a key's passphrase weakens it and should
-  be avoided on a security tool).
+- **C++** also supports passphrase-protected private keys via `decrypt --passphrase`
+  (it unlocks the key with the passphrase, using an in-house `bcrypt_pbkdf` and
+  AES-CTR; OpenSSL is used for AES when available, with a bundled fallback
+  otherwise). Either way, do not remove your key's passphrase — that weakens your
+  SSH key and is unnecessary.
 
 ---
 
@@ -598,11 +599,20 @@ PKCrypt only accepts **Ed25519** keys. Generate one with:
 ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
 ```
 
-### `error: encrypted/passphrase-protected private keys are not supported`
-(Common with the C++ binary.) The private key has a passphrase. Use the **Python**
-implementation with `decrypt --passphrase` instead. Do **not** empty the key's
-passphrase (for example with `ssh-keygen -p -f ~/.ssh/id_ed25519 -N ""`) just to
-use the C++ binary — that weakens your SSH key.
+### I have a passphrase-protected private key
+Both implementations accept one via `decrypt --passphrase`, which prompts for the
+passphrase at a terminal (it is never echoed or stored):
+
+```bash
+pkcrypt decrypt --passphrase ~/.ssh/id_ed25519 secret.pkcrypt
+python3 -m pkcrypt_lib decrypt --passphrase ~/.ssh/id_ed25519 secret.pkcrypt
+```
+
+The C++ binary unlocks the key with an in-house `bcrypt_pbkdf` and AES-CTR
+(using OpenSSL's AES when available, and a bundled fallback otherwise), so it
+works on systems without OpenSSL. Do **not** empty your key's passphrase (for
+example with `ssh-keygen -p -f ~/.ssh/id_ed25519 -N ""` just to use a tool) —
+that weakens your SSH key.
 
 ### `import error: libsodium is required ...`
 (Python, at import time.) Install libsodium:

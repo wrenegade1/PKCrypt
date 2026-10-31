@@ -60,7 +60,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 # ---------------------------------------------------------------------------

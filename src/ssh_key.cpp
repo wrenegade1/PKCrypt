@@ -17,6 +17,10 @@
 
 // Own base64 decoder (see base64.cpp), verified against the reference.
 #include "pkcrypt/base64.h"
+// bcrypt_pbkdf (OpenSSH's private-key KDF) and AES-CTR, for decrypting
+// passphrase-protected keys.
+#include "pkcrypt/bcrypt_pbkdf.h"
+#include "pkcrypt/aes_ctr.h"
 
 #include <sodium.h>
 
@@ -30,7 +34,11 @@ class Reader {
 public:
     explicit Reader(std::vector<unsigned char> data) : data_(std::move(data)) {}
 
-    // Reads a big-endian 4-byte integer.
+    // Read from an existing buffer (no copy); the buffer must outlive this.
+    Reader(const unsigned char* data, size_t len)
+        : data_(data, data + len) {}
+
+    // Read a big-endian 4-byte integer.
     bool read_u32(uint32_t& out) {
         if (pos_ + 4 > data_.size()) return false;
         out = (static_cast<uint32_t>(data_[pos_]) << 24) |
@@ -120,6 +128,81 @@ bool parse_private_pem(const std::string& content, std::vector<unsigned char>& r
     return base64_decode(b64, raw);
 }
 
+// The cipher's key and IV lengths; -1 for an unsupported symmetric cipher.
+// (the modern `ssh-keygen` default is aes256-ctr).
+int cipher_key_len(const std::string& name) {
+    if (name == "aes128-ctr") return 16;
+    if (name == "aes192-ctr") return 24;
+    if (name == "aes256-ctr") return 32;
+    return -1;
+}
+
+// Decrypt an OpenSSH private blob encrypted with a passphrase (OpenSSH's
+// "openssh-key-v1" format: cipher + bcrypt KDF + encrypted private blob).
+// `cipher` and `kdf` (with its bytes) and `kdfopts` were read from the header.
+// On success the private blob is decrypted into `plain` and returns true.
+//
+// Currently supports cipher "aes128-ctr"/"aes192-ctr"/"aes256-ctr" with the
+// "bcrypt" KDF (the modern default for `ssh-keygen -t ed25519`). Returns false
+// with `error` otherwise. The recovered plaintext is what OpenSSH stores
+// unencrypted for a non-passphrase key, and is wiped before returning.
+bool decrypt_encrypted_blob(const std::string& cipher_name,
+                            const std::string& kdf_name,
+                            const std::vector<unsigned char>& kdfopts,
+                            const char* passphrase,
+                            const std::vector<unsigned char>& priv_blob,
+                            std::vector<unsigned char>& plain, std::string& error) {
+    const int key_len = cipher_key_len(cipher_name);
+    if (key_len < 0) {
+        error = "unsupported key cipher '" + cipher_name + "' (this build supports "
+                "aes128/192/256-ctr from OpenSSH; the Python CLI handles other ciphers)";
+        return false;
+    }
+    if (kdf_name != "bcrypt") {
+        error = "unsupported key KDF '" + kdf_name + "'";
+        return false;
+    }
+    if (passphrase == nullptr) {
+        error = "private key is passphrase protected; supply --passphrase";
+        return false;
+    }
+    // kdfopts for bcrypt: a length-prefixed 16-byte salt, then 4-byte rounds.
+    Reader kr(kdfopts);
+    std::vector<unsigned char> salt;
+    if (!kr.read_string(salt) || salt.size() != 16) {
+        error = "malformed key: bcrypt KDF options";
+        return false;
+    }
+    uint32_t rounds_u32;
+    if (!kr.read_u32(rounds_u32)) {
+        error = "malformed key: bcrypt KDF options";
+        return false;
+    }
+
+    // Derive key+iv: bcrypt_pbkdf(passphrase, salt, key_len + iv_len, rounds).
+    // IV is 16 bytes for every AES-CTR variant.
+    const size_t iv_len = 16;
+    std::vector<unsigned char> ky(key_len + iv_len);
+    if (!bcrypt_pbkdf(passphrase, std::strlen(passphrase), salt.data(), salt.size(),
+                      ky.data(), ky.size(), rounds_u32)) {
+        sodium_memzero(ky.data(), ky.size());
+        error = "bcrypt KDF failed";
+        return false;
+    }
+
+    std::vector<unsigned char> out(priv_blob.size());
+    const bool ok = aes_ctr_crypt(ky.data(), static_cast<size_t>(key_len),
+                                  ky.data() + key_len, priv_blob.data(),
+                                  out.data(), priv_blob.size());
+    sodium_memzero(ky.data(), ky.size());
+    if (!ok) {
+        error = "AES decryption of private key failed";
+        return false;
+    }
+    plain = std::move(out);
+    return true;
+}
+
 } // namespace
 
 std::optional<Ed25519Key> parse_ssh_public_key_file(const std::string& path,
@@ -143,7 +226,8 @@ std::optional<Ed25519Key> parse_ssh_public_key_file(const std::string& path,
 }
 
 std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
-                                                     std::string& error) {
+                                                     std::string& error,
+                                                     const char* passphrase) {
     std::ifstream f(path);
     if (!f.is_open()) { error = "cannot open private key file: " + path; return std::nullopt; }
     std::string content((std::istreambuf_iterator<char>(f)),
@@ -168,11 +252,6 @@ std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
     if (!r.read_string(kdfopts)){ error = "malformed key: kdf options";return std::nullopt; }
     std::string cipher_name(cipher.begin(), cipher.end());
     std::string kdf_name(kdf.begin(), kdf.end());
-    if (cipher_name != "none" || kdf_name != "none") {
-        error = "encrypted/passphrase-protected private keys are not supported; "
-                "decrypt first with: ssh-keygen -p -f <keyfile> -N \"\"";
-        return std::nullopt;
-    }
 
     uint32_t nkeys;
     if (!r.read_u32(nkeys)) { error = "malformed key: key count"; return std::nullopt; }
@@ -185,11 +264,25 @@ std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
     std::vector<unsigned char> pub_blob;
     if (!r.read_string(pub_blob)) { error = "malformed key: public blob"; return std::nullopt; }
 
-    // Private key blob.
+    // Private key blob. With a passphrase this is encrypted; decrypt it (and
+    // wipe the encrypted buffer) before parsing.
     std::vector<unsigned char> priv_blob;
     if (!r.read_string(priv_blob)) { error = "malformed key: private blob"; return std::nullopt; }
+    std::vector<unsigned char> priv_plain;
+    const unsigned char* priv_data = priv_blob.data();
+    size_t priv_size = priv_blob.size();
+    if (cipher_name != "none" || kdf_name != "none") {
+        if (!decrypt_encrypted_blob(cipher_name, kdf_name, kdfopts, passphrase,
+                                    priv_blob, priv_plain, error)) {
+            sodium_memzero(priv_blob.data(), priv_blob.size());
+            return std::nullopt;
+        }
+        priv_data = priv_plain.data();
+        priv_size = priv_plain.size();
+        sodium_memzero(priv_blob.data(), priv_blob.size());
+    }
 
-    Reader pr(priv_blob);
+    Reader pr(priv_data, priv_size);
     uint32_t check1, check2;
     if (!pr.read_u32(check1)) { error = "malformed private key"; return std::nullopt; }
     if (!pr.read_u32(check2)) { error = "malformed private key"; return std::nullopt; }
@@ -245,6 +338,7 @@ std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
 
     // Wipe the raw seed/key material from temporary buffers before returning.
     sodium_memzero(priv_raw.data(), priv_raw.size());
+    if (!priv_plain.empty()) sodium_memzero(priv_plain.data(), priv_plain.size());
     sodium_memzero(raw.data(), raw.size());
     return key;
 }

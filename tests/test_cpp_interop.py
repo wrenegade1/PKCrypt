@@ -46,6 +46,58 @@ def make_test_keypair(tmp: Path, comment: str = "test@example",
     return str(priv), str(pub)
 
 
+def make_passphrase_keypair(tmp: Path, passphrase: str,
+                            comment: str = "prot@example",
+                            name: str = "prot_ed25519"):
+    """Generate a passphrase-protected Ed25519 key; return (priv, pub)."""
+    priv = tmp / name
+    pub = tmp / (name + ".pub")
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", passphrase, "-q",
+         "-f", str(priv), "-C", comment],
+        check=True,
+    )
+    return str(priv), str(pub)
+
+
+def run_with_input(input_bytes: bytes, *cmd):
+    """Run `cmd`, answering any terminal prompts with `input_bytes`
+    (allocates a real controlling pty, so getpass() reads the answer)."""
+    import pty as _pty
+
+    pid, fd = _pty.fork()
+    if pid == 0:
+        os.execvp(cmd[0], list(cmd))
+    import select
+    import time
+
+    def drain(timeout: float = 8.0) -> bytes:
+        end = time.time() + timeout
+        out = b""
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if r:
+                try:
+                    d = os.read(fd, 1024)
+                except OSError:
+                    break
+                if not d:
+                    break
+                out += d
+        return out
+
+    time.sleep(0.7)
+    try:
+        os.write(fd, input_bytes)
+    except OSError:
+        pass
+    out = drain(15.0)
+    os.close(fd)
+    _pid, status = os.waitpid(pid, 0)
+    code = os.waitstatus_to_exitcode(status)
+    return code, out.decode("utf-8", "replace")
+
+
 def results():
     passed = failed = 0
 
@@ -166,6 +218,64 @@ def main() -> int:
                     check(f"{tag} truncation rejected",
                           r.returncode != 0 and not cut_out.exists(),
                           "truncated file decrypted!")
+
+        # --- I) Passphrase-protected private keys (C++ binary) ---------------
+        pprt, ppub = make_passphrase_keypair(tmp, "correct horse battery")
+        prot_payload = tmp / "prot_payload.bin"
+        prot_payload.write_bytes(b"protected payload " + os.urandom(128))
+
+        # C++ self round-trip with --passphrase.
+        pp_ct = tmp / "pp_ct.pkcrypt"
+        r = run(str(BIN), "encrypt", ppub, str(prot_payload), str(pp_ct))
+        check("passphrase: C++ encrypt exits 0", r.returncode == 0, r.stderr)
+        pp_out = tmp / "pp_out.bin"
+        code, _ = run_with_input(b"correct horse battery\n", str(BIN),
+                                 "decrypt", "--passphrase", pprt, str(pp_ct),
+                                 str(pp_out))
+        check("passphrase: C++ --passphrase round-trip",
+              code == 0 and pp_out.read_bytes() == prot_payload.read_bytes(),
+              f"exit {code}")
+
+        # Cross-tool: Python encrypt -> C++ decrypt with --passphrase.
+        pp_cross = tmp / "pp_cross.pkcrypt"
+        r = run(PY, "-m", "pkcrypt_lib", "encrypt", ppub, str(prot_payload),
+                str(pp_cross))
+        pp_xout = tmp / "pp_xout.bin"
+        code, _ = run_with_input(b"correct horse battery\n", str(BIN),
+                                 "decrypt", "--passphrase", pprt, str(pp_cross),
+                                 str(pp_xout))
+        check("passphrase: Python->C++ --passphrase round-trip",
+              r.returncode == 0 and code == 0 and
+              pp_xout.read_bytes() == prot_payload.read_bytes(),
+              f"exit {code}")
+
+        # Cross-tool: C++ encrypt -> Python decrypt with --passphrase.
+        pp_pyout = tmp / "pp_pyout.bin"
+        code, _ = run_with_input(b"correct horse battery\n", PY, "-m",
+                                 "pkcrypt_lib", "decrypt", "--passphrase", pprt,
+                                 str(pp_ct), str(pp_pyout))
+        check("passphrase: C++->Python --passphrase round-trip",
+              code == 0 and pp_pyout.read_bytes() == prot_payload.read_bytes(),
+              f"exit {code}")
+
+        # Wrong passphrase must fail, no output, on the C++ side.
+        pp_bad = tmp / "pp_bad.pkcrypt"
+        r = run(str(BIN), "encrypt", ppub, str(prot_payload), str(pp_bad))
+        pp_badout = tmp / "pp_bad.out"
+        code, _ = run_with_input(b"wrong passphrase\n", str(BIN),
+                                 "decrypt", "--passphrase", pprt, str(pp_bad),
+                                 str(pp_badout))
+        check("passphrase: wrong passphrase rejected",
+              code != 0 and not pp_badout.exists(), f"decrypted with exit {code}")
+
+        # Encrypted key without --passphrase must be rejected clearly.
+        pp_none = tmp / "pp_none.pkcrypt"
+        r = run(str(BIN), "encrypt", ppub, str(prot_payload), str(pp_none))
+        pp_noneout = tmp / "pp_none.out"
+        r = run(str(BIN), "decrypt", pprt, str(pp_none), str(pp_noneout))
+        check("passphrase: protected key without --passphrase rejected",
+              r.returncode != 0 and not pp_noneout.exists() and
+              "passphrase" in r.stderr.lower(), r.stderr)
 
     finally:
         pass  # tmp cleaned on exit by tempfile caller
