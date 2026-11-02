@@ -1,0 +1,7 @@
+# XcodeGen-generated artifacts (regenerate with `xcodegen generate`)
+*.xcodeproj
+Info.plist
+
+# Build products
+DerivedData/
+build/

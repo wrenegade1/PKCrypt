@@ -1,0 +1,60 @@
+# CryptFile — XcodeGen spec → CryptFile.xcodeproj (a macOS 13 App bundle).
+#
+# The app depends on the in-tree PKCryptEngine SwiftPM package (../PKCryptEngine);
+# that package's own linkerSettings.unsafeFlags(["/opt/homebrew/lib/libsodium.a"])
+# carries the statically-linked libsodium archive into the final app binary
+# (Phase-1 D-02 — no separate dylib signature, no disable-library-validation).
+name: CryptFile
+options:
+  bundleIdPrefix: com.pkcrypt
+  deploymentTarget:
+    macOS: "13.0"
+packages:
+  PKCryptEngine:
+    path: ../PKCryptEngine
+targets:
+  CryptFile:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    dependencies:
+      - package: PKCryptEngine
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.pkcrypt.CryptFile
+        MACOSX_DEPLOYMENT_TARGET: "13.0"
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_ENTITLEMENTS: CryptFile.entitlements
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: CryptFile
+        LSMinimumSystemVersion: "13.0"
+        NSHighResolutionCapable: true
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+    entitlements:
+      path: CryptFile.entitlements
+      properties:
+        # Exactly the three sandbox entitlements audited in FEASIBILITY-VERDICT
+        # §2 D-05. NO downloads.read-write, NO disable-library-validation
+        # (libsodium is statically linked, not a dylib).
+        com.apple.security.app-sandbox: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.files.bookmarks.app-scope: true
+    scheme:
+      testTargets:
+        - CryptFileTests
+  CryptFileTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/CryptFileTests
+    dependencies:
+      - target: CryptFile          # TEST_HOST: runs in-app, allows @testable import CryptFile
+      - package: PKCryptEngine     # import PKCryptEngine directly for engine-wiring tests
+    settings:
+      base:
+        SWIFT_VERSION: "5.9"
