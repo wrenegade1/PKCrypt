@@ -8,10 +8,11 @@ import SwiftUI
 struct ContentView: View {
     @AppStorage("selectedTab") private var selectedTab = 0
     @State private var showingHelp = false
+    @StateObject private var workflow = WorkflowViewModel()
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            EncryptView()
+            EncryptView(viewModel: workflow)
                 .tabItem { Label("Encrypt", systemImage: "lock.fill") }
                 .tag(0)
             DecryptView()

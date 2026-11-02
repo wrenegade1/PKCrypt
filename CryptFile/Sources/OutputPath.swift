@@ -1,12 +1,20 @@
 import Foundation
+import PKCryptEngine
 
-// MARK: - RED scaffold stub (Plan 03-01 Task 2)
-//
-// Compile-enabling stub so FacadeRoutingTests builds and genuinely fails on the
-// planned output-naming assertion. The real implementation (delegating to the
-// engine's SafeOutputPublisher helpers, D-14) lands in the Task-2 GREEN commit.
+/// App-side wrapper around the engine's CLI-derived output-name rules (D-14).
+/// The app always delegates to the engine's `SafeOutputPublisher` helpers and
+/// never re-derives the naming contract. A collision at publication time is
+/// surfaced as `EngineError.destinationExists` (D-16) — the app never auto-numbers
+/// or overwrites.
 enum OutputPath {
+    /// Default encrypted output: `<input>.pkcrypt` (mirrors the engine helper).
     static func destination(encrypting input: URL) -> URL {
-        URL(fileURLWithPath: "")   // TODO stub: real impl returns <input>.pkcrypt
+        SafeOutputPublisher.encryptedOutputPath(for: input)
+    }
+
+    /// Default decrypted output: strips a trailing `.pkcrypt`, else appends
+    /// `.decrypted` (no auto-numbering — a real collision stays `destinationExists`).
+    static func destination(decrypting input: URL) -> URL {
+        SafeOutputPublisher.decryptedOutputPath(for: input)
     }
 }
