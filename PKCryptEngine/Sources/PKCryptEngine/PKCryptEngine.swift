@@ -123,9 +123,41 @@ public enum PKCryptEngine {
     private static func encryptRSA(fileURL: URL, recipient: RSAPublicKeyMaterial,
                                    destinationURL: URL,
                                    progress: ProgressHandler?) throws -> URL {
-        // RED stub — implemented in the GREEN commit.
-        _ = (fileURL, recipient, destinationURL, progress)
-        throw EngineError.ioError("RSA encrypt not implemented")
+        // Fresh random 32-byte session key per encrypt (T-02-17 non-determinism).
+        let sessionKey = randomBytes(32)
+        let wrapped = try KeyMaterial.rsaWrap(sessionKey: sessionKey, publicKey: recipient)
+
+        let baseNonce = randomBytes(ContainerCodec.nonceAES)
+        let chunkLen = UInt32(ContainerCodec.defaultChunkLen)
+        let header = try RSAHeader(cipher: ContainerCodec.cipherAES,
+                                   payloadType: ContainerCodec.payloadFile,
+                                   alg: ContainerCodec.rsaAlgOAEPSHA256,
+                                   wrappedKey: wrapped, baseNonce: baseNonce,
+                                   chunkLen: chunkLen, modulusBytes: recipient.modulusBytes).bytes
+
+        let publisher = SafeOutputPublisher(destinationURL: destinationURL)
+        let fh: FileHandle
+        do { fh = try publisher.start() } catch { throw error }
+        var processed: Int64 = 0
+        let total = fileSize(of: fileURL)
+        do {
+            try fh.write(contentsOf: header)
+            let crypto = AesGcmChunkCrypto(key: sessionKey, header: header,
+                                           baseNonce: baseNonce, chunkLen: Int(chunkLen))
+            let enc = ChunkedEncryptor(crypto: crypto) { chunk in
+                try Cancellation.checkChunkCancellation()   // D-16: between chunks
+                processed += Int64(chunk.count)
+                progress?(EngineProgress(bytesProcessed: processed, totalBytes: total))
+                try fh.write(contentsOf: chunk)
+            }
+            try streamFilePieces(fileURL) { try enc.write($0) }
+            try enc.finish()
+            try publisher.publish(fh: fh)                  // only after full success
+            return destinationURL
+        } catch {
+            publisher.abort()                              // remove temp, publish nothing
+            throw error
+        }
     }
 
     // MARK: - Decrypt
