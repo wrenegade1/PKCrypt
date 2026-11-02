@@ -1,0 +1,4 @@
+module CSodium {
+    header "shim.h"
+    export *
+}
