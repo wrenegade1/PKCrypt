@@ -86,9 +86,50 @@ struct OracleInteropTests {
         ct = core.encrypt_bytes(pt, ed)
         open(out, 'wb').write(ct)
         print(hashlib.sha256(pt).hexdigest())
+    elif mode == 'rsa_decrypt':
+        container, privpath = sys.argv[2], sys.argv[3]
+        data = open(container, 'rb').read()
+        k = keys.load_private_key(privpath)
+        pt = core.decrypt_bytes_rsa(data, k.key)
+        print(hashlib.sha256(pt).hexdigest())
+    elif mode == 'rsa_encrypt':
+        pubpath, n_s, out = sys.argv[2], sys.argv[3], sys.argv[4]
+        n = int(n_s)
+        pub = keys.load_public_key(pubpath)
+        pt = bytes((i*7+3)&0xFF for i in range(n))
+        ct = core.encrypt_bytes_rsa(pt, pub.key)
+        open(out, 'wb').write(ct)
+        print(hashlib.sha256(pt).hexdigest())
     else:
         sys.exit(2)
     """
+
+    @Test("Swift RSA v3 encrypt -> Python oracle RSA decrypts to the same bytes", arguments: [(2048, (1 << 20) + 1, "rsa2048"), (4096, 0, "rsa4096")])
+    func swiftRsaToOracle(bits: Int, size: Int, name: String) throws {
+        let scratch = Scratch()
+        defer { scratch.cleanup() }
+        let pub = bits == 2048 ? Fixtures.rsa2048Public : Fixtures.rsa4096Public
+        let privPath = Fixtures.rsaDir.appendingPathComponent(name)
+        let container = try RSAPipe.encrypt(pattern(size), pub: pub)
+        try container.write(to: scratch.container)
+        let (rc, out) = Self.runPython(Self.pythonScript,
+                                       ["rsa_decrypt", scratch.container.path, privPath.path])
+        #expect(rc == 0, "oracle RSA decrypt failed: \(out)")
+        #expect(out.trimmingCharacters(in: .whitespacesAndNewlines) == Self.patternSHA256(size))
+    }
+
+    @Test("Python oracle RSA v3 encrypt -> Swift RSA decrypts to the same bytes", arguments: [(2048, 0, "rsa2048"), (4096, 1 << 20, "rsa4096")])
+    func oracleRsaToSwift(bits: Int, size: Int, name: String) throws {
+        let scratch = Scratch()
+        defer { scratch.cleanup() }
+        let pubPath = Fixtures.rsaDir.appendingPathComponent("\(name).pub")
+        let (rc, out) = Self.runPython(Self.pythonScript,
+                                       ["rsa_encrypt", pubPath.path, "\(size)", scratch.container.path])
+        #expect(rc == 0, "oracle RSA encrypt failed: \(out)")
+        let priv = bits == 2048 ? Fixtures.rsa2048Material : Fixtures.rsa4096Material
+        let recovered = try RSAPipe.decrypt(try Data(contentsOf: scratch.container), priv: priv)
+        #expect(recovered == pattern(size))
+    }
 
     @Test("Swift encrypts -> Python oracle decrypts to the same bytes", arguments: [0, 1 << 20, (1 << 20) + 1])
     func swiftToOracle(size: Int) throws {

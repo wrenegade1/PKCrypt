@@ -46,6 +46,35 @@ struct Fixtures {
     static let publicKey: PublicKeyMaterial = {
         try! KeyMaterial.parseEd25519Public(Data(contentsOf: publicKeyURL))
     }()
+
+    // RSA fixtures
+    static let rsaDir = dir.appendingPathComponent("RSA")
+    static let rsa2048Priv = rsaDir.appendingPathComponent("rsa2048")
+    static let rsa2048Pub = rsaDir.appendingPathComponent("rsa2048.pub")
+    static let rsa4096Priv = rsaDir.appendingPathComponent("rsa4096")
+    static let rsa4096Pub = rsaDir.appendingPathComponent("rsa4096.pub")
+    static let rsaOtherPriv = rsaDir.appendingPathComponent("rsa2048_other")
+    static let rsaContainersDir = rsaDir.appendingPathComponent("Containers")
+
+    static let rsa2048Material: RSAPrivateKeyMaterial = {
+        try! KeyMaterial.parseRSAPrivate(Data(contentsOf: rsa2048Priv))
+    }()
+    static let rsa2048Public: RSAPublicKeyMaterial = {
+        try! KeyMaterial.parseRSAPublic(Data(contentsOf: rsa2048Pub))
+    }()
+    static let rsa4096Material: RSAPrivateKeyMaterial = {
+        try! KeyMaterial.parseRSAPrivate(Data(contentsOf: rsa4096Priv))
+    }()
+    static let rsa4096Public: RSAPublicKeyMaterial = {
+        try! KeyMaterial.parseRSAPublic(Data(contentsOf: rsa4096Pub))
+    }()
+    static let rsaOtherMaterial: RSAPrivateKeyMaterial = {
+        try! KeyMaterial.parseRSAPrivate(Data(contentsOf: rsaOtherPriv))
+    }()
+
+    static func rsaContainer(_ name: String) -> Data {
+        try! Data(contentsOf: rsaContainersDir.appendingPathComponent("\(name).pkcrypt"))
+    }
 }
 
 /// A unique scratch destination directory per test.
@@ -59,6 +88,57 @@ struct Scratch {
     var container: URL { dir.appendingPathComponent("out.pkcrypt") }
     var output: URL { dir.appendingPathComponent("out") }
     func cleanup() { try? FileManager.default.removeItem(at: dir) }
+}
+
+/// Composers/decomposers for a complete v3 (RSA) AES-GCM container, exercised in
+/// these tests through the public building blocks (RSAHeader + KeyMaterial RSA
+/// wrap/unwrap + AesGcmChunkCrypto + ChunkedEncryptor/Decryptor).
+enum RSAPipe {
+    static func random(_ n: Int) -> Data {
+        var g = SystemRandomNumberGenerator()
+        return Data((0 ..< n).map { _ in UInt8.random(in: .min ... .max, using: &g) })
+    }
+
+    /// Encrypt `plaintext` into a complete v3 AES-GCM container for an RSA public
+    /// key (a fresh random 32-byte session key per encrypt, T-02-17).
+    static func encrypt(_ plaintext: Data, pub: RSAPublicKeyMaterial,
+                        chunkLen: UInt32 = UInt32(ContainerCodec.defaultChunkLen)) throws -> Data {
+        let sessionKey = random(32)
+        let wrapped = try KeyMaterial.rsaWrap(sessionKey: sessionKey, publicKey: pub)
+        let nonce = random(ContainerCodec.nonceAES)
+        let header = try RSAHeader(cipher: ContainerCodec.cipherAES,
+                                   payloadType: ContainerCodec.payloadFile,
+                                   alg: ContainerCodec.rsaAlgOAEPSHA256,
+                                   wrappedKey: wrapped, baseNonce: nonce,
+                                   chunkLen: chunkLen, modulusBytes: pub.modulusBytes).bytes
+        let crypto = AesGcmChunkCrypto(key: sessionKey, header: header,
+                                       baseNonce: nonce, chunkLen: Int(chunkLen))
+        var body = Data()
+        let enc = ChunkedEncryptor(crypto: crypto) { body.append($0) }
+        try enc.write(plaintext)
+        try enc.finish()
+        return header + body
+    }
+
+    /// Decrypt a complete v3 container with an RSA private key, returning the
+    /// recovered plaintext.
+    static func decrypt(_ container: Data, priv: RSAPrivateKeyMaterial) throws -> Data {
+        let header = try RSAHeader.parse(container, modulusBytes: priv.modulusBytes)
+        let sessionKey = try KeyMaterial.rsaUnwrap(wrapped: header.wrappedKey, privateKey: priv)
+        let headerBytes = Data(container.prefix(
+            RSAHeader.headerSize(nonceLen: header.baseNonce.count, modulusBytes: priv.modulusBytes)))
+        let crypto = AesGcmChunkCrypto(key: sessionKey, header: headerBytes,
+                                       baseNonce: header.baseNonce, chunkLen: Int(header.chunkLen))
+        let dec = ChunkedDecryptor(crypto: crypto)
+        var out = Data()
+        var first = true
+        let body = Data(container[headerBytes.count...])
+        try dec.run(reader: {
+            if first { first = false; return body }
+            return nil
+        }) { out.append($0) }
+        return out
+    }
 }
 
 // MARK: - Format vectors (deterministic byte-exactness)
@@ -178,6 +258,115 @@ struct FormatVectorTests {
         }
         #expect(err == .authFailure)
         #expect(!FileManager.default.fileExists(atPath: scratch.output.path))
+    }
+
+    // MARK: v3 RSA header byte vectors
+
+    @Test("v3 header layout is byte-exact: magic PKCRYPT\\x03 | cipher | payload | alg | wrapped | nonce | chunk_len")
+    func rsa2048HeaderByteVector() throws {
+        // Deterministic 256-byte wrapped key (values 1..255, then 0x00).
+        let wrapped = Data((1 ... 256).map { UInt8($0 & 0xFF) })
+        let nonce = Data((0x21 ... 0x2c).map { UInt8($0) })   // 12 bytes
+        let header = try RSAHeader(cipher: 0x00, payloadType: 0x00, alg: 0x00,
+                                   wrappedKey: wrapped, baseNonce: nonce,
+                                   chunkLen: 1 << 20, modulusBytes: 256).bytes
+        #expect(header.count == 8 + 1 + 1 + 1 + 256 + 12 + 4)
+        #expect(Array(header[0 ..< 8]) == Array("PKCRYPT\u{03}".utf8))
+        #expect(header[8] == 0x00)    // cipher AES
+        #expect(header[9] == 0x00)    // payload file
+        #expect(header[10] == 0x00)   // alg rsa-oaep-sha256
+        #expect(header[11] == 0x01)   // first wrapped-key byte (value 1)
+        #expect(header[11 + 255] == 0x00)  // 256th wrapped byte (256 & 0xFF)
+        #expect(header[11 + 256] == 0x21)  // nonce starts right after wrapped key
+        #expect(Array(header.suffix(4)) == [0x00, 0x10, 0x00, 0x00])  // chunk_len = 1 MiB BE
+    }
+
+    @Test("a v3 header for RSA-4096 has a 512-byte wrapped key computed from the modulus, not hardcoded 256")
+    func rsa4096WrappedKeyIs512() throws {
+        // Real encryption with the RSA-4096 key: the wrapped-key field must be
+        // 512 bytes = (4096+7)/8, proving (modulus_bits+7)/8 is used.
+        let container = try RSAPipe.encrypt(pattern(64), pub: Fixtures.rsa4096Public)
+        let header = try RSAHeader.parse(container, modulusBytes: Fixtures.rsa4096Material.modulusBytes)
+        #expect(Fixtures.rsa4096Material.modulusBytes == 512)
+        #expect(header.wrappedKey.count == 512)
+        // And RSA-2048 is 256, not mistaken for 512.
+        let c2048 = try RSAPipe.encrypt(pattern(64), pub: Fixtures.rsa2048Public)
+        let h2048 = try RSAHeader.parse(c2048, modulusBytes: Fixtures.rsa2048Material.modulusBytes)
+        #expect(h2048.wrappedKey.count == 256)
+    }
+
+    // MARK: RSA round-trips against committed oracle containers
+
+    @Test("decrypts oracle-produced RSA AES-GCM containers at 0 / 1 MiB / 1 MiB+1, both key sizes")
+    func decryptOracleRsaFixtures() throws {
+        let aes: [(String, Int)] = [("empty", 0), ("1MiB", 1 << 20), ("1MiBplus1", (1 << 20) + 1)]
+        for (kind, material) in [("rsa2048", Fixtures.rsa2048Material), ("rsa4096", Fixtures.rsa4096Material)] {
+            for (suffix, n) in aes {
+                let container = Fixtures.rsaContainer("\(kind)_\(suffix)")
+                let recovered = try RSAPipe.decrypt(container, priv: material)
+                #expect(recovered == pattern(n), "\(kind) \(suffix) recovered != original (\(recovered.count) vs \(n))")
+            }
+        }
+    }
+
+    @Test("Swift RSA encrypt produces a container that round-trips back at 0 / 1 MiB / 1 MiB+1")
+    func swiftRsaSelfRoundTrip() throws {
+        for (pub, priv) in [(Fixtures.rsa2048Public, Fixtures.rsa2048Material),
+                            (Fixtures.rsa4096Public, Fixtures.rsa4096Material)] {
+            for n in [0, 1 << 20, (1 << 20) + 1] {
+                let container = try RSAPipe.encrypt(pattern(n), pub: pub)
+                let recovered = try RSAPipe.decrypt(container, priv: priv)
+                #expect(recovered == pattern(n), "size \(n) recovered != original")
+            }
+        }
+    }
+
+    // MARK: RSA negative boundary (D-13)
+
+    @Test("an RSA key with modulus < 2048 bits returns keyError before any crypto")
+    func rsaShortKeyRejected() throws {
+        // Committed RSA-1024 public key (ssh-keygen -b 1024).
+        let smallPub = Fixtures.rsaDir.appendingPathComponent("small_rsa.pub")
+        do {
+            _ = try KeyMaterial.parseRSAPublic(Data(contentsOf: smallPub))
+            Issue.record("expected keyError for a short (1024-bit) RSA modulus")
+        } catch let e {
+            // Parsing/size failure is a pre-crypto keyError (D-13).
+            guard case .keyError? = e as? EngineError else {
+                Issue.record("expected keyError, got \(e)")
+                return
+            }
+        }
+    }
+
+    @Test("RSA-OAEP unwrap with the wrong private key folds into the single generic authFailure")
+    func rsaWrongKeyAuthFailure() throws {
+        // Encrypt with rsa2048's public key, then try to decrypt with a different
+        // same-size RSA-2048 private key (rsa2048_other).
+        let container = try RSAPipe.encrypt(pattern(128), pub: Fixtures.rsa2048Public)
+        do {
+            _ = try RSAPipe.decrypt(container, priv: Fixtures.rsaOtherMaterial)
+            Issue.record("expected authFailure for wrong RSA key")
+        } catch let e {
+            // Wrong-key unwrap folds into the single generic authFailure (T-02-09/D-13).
+            guard case .authFailure? = e as? EngineError else {
+                Issue.record("expected authFailure, got \(e)")
+                return
+            }
+        }
+    }
+
+    // MARK: RSA session-key freshness (T-02-17)
+
+    @Test("two RSA encrypts of identical plaintext to the same key differ in wrapped-key AND ciphertext bytes")
+    func rsaEncryptFreshness() throws {
+        let c1 = try RSAPipe.encrypt(pattern(64), pub: Fixtures.rsa2048Public)
+        let c2 = try RSAPipe.encrypt(pattern(64), pub: Fixtures.rsa2048Public)
+        let h1 = try RSAHeader.parse(c1, modulusBytes: 256)
+        let h2 = try RSAHeader.parse(c2, modulusBytes: 256)
+        #expect(h1.wrappedKey != h2.wrappedKey,
+                "a fresh random 32-byte session key per encrypt must produce different wrapped keys")
+        #expect(c1 != c2, "different session keys/nonces must produce different full containers")
     }
 }
 
