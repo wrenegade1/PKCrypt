@@ -279,6 +279,111 @@ struct SafeOutputPublisherTests {
         #expect(!FileManager.default.fileExists(atPath: d.file("out").path), "no plaintext may be published")
         #expect(d.tempArtifacts().isEmpty, "auth failure must remove the temp")
     }
+
+    // MARK: - Task 3: cancellation-mid-write / failure-before-publish / concurrency safety
+
+    @Test("a simulated failure after staging but before publish leaves the destination absent and removes the temp")
+    func failureAfterStagingBeforePublish() async throws {
+        let d = SafeDir(); defer { d.cleanup() }
+        let big = 2 * ContainerCodec.defaultChunkLen   // 2 MiB -> 2 chunks
+        let input = d.file("in")
+        try pattern(big).write(to: input)
+        _ = try await PKCryptEngine.encrypt(fileURL: input, recipient: Fixtures.publicKey,
+                                            destinationURL: d.file("out.pkcrypt")).get()
+
+        // Corrupt one byte inside the SECOND chunk's ciphertext so the first
+        // chunk still authenticates (its plaintext is staged to the temp) but
+        // the final chunk fails auth -> the operation aborts before publish.
+        var container = try Data(contentsOf: d.file("out.pkcrypt"))
+        let headerSize = ContainerCodec.prefixBytes + ContainerCodec.ephPubBytes
+            + ContainerCodec.nonceAES + ContainerCodec.chunkLenBytes   // 58
+        let chunk0Len = ContainerCodec.defaultChunkLen + ContainerCodec.tagBytes
+        container[headerSize + chunk0Len + 200] ^= 0x01   // inside chunk 1
+        try container.write(to: d.file("tampered.pkcrypt"))
+
+        let result = await PKCryptEngine.decrypt(containerURL: d.file("tampered.pkcrypt"),
+                                                 privateKey: Fixtures.privateKey,
+                                                 destinationURL: d.file("out"))
+        guard case .failure(let err) = result else {
+            Issue.record("expected an auth-stage failure after staging")
+            return
+        }
+        #expect(err == .authFailure)
+        #expect(!FileManager.default.fileExists(atPath: d.file("out").path),
+                "destination must stay absent — publish is gated on full-stream auth")
+        #expect(d.tempArtifacts().isEmpty, "the staged partial temp must be removed on the failed publish")
+    }
+
+    @Test("two concurrent decrypts to the same destination: exactly one success, one destinationExists, no corrupt output")
+    func concurrentSameDestinationRace() async throws {
+        let d = SafeDir(); defer { d.cleanup() }
+        let plainA = Data(repeating: 0xAA, count: 2 * ContainerCodec.defaultChunkLen)
+        let plainB = Data(repeating: 0xBB, count: 2 * ContainerCodec.defaultChunkLen)
+        try plainA.write(to: d.file("a")); try plainB.write(to: d.file("b"))
+        _ = try await PKCryptEngine.encrypt(fileURL: d.file("a"), recipient: Fixtures.publicKey,
+                                            destinationURL: d.file("a.pkcrypt")).get()
+        _ = try await PKCryptEngine.encrypt(fileURL: d.file("b"), recipient: Fixtures.publicKey,
+                                            destinationURL: d.file("b.pkcrypt")).get()
+
+        let dest = d.file("out")
+        let results = await withTaskGroup(of: EngineResult<URL>.self) { group -> [EngineResult<URL>] in
+            group.addTask {
+                await PKCryptEngine.decrypt(containerURL: d.file("a.pkcrypt"),
+                                            privateKey: Fixtures.privateKey, destinationURL: dest)
+            }
+            group.addTask {
+                await PKCryptEngine.decrypt(containerURL: d.file("b.pkcrypt"),
+                                            privateKey: Fixtures.privateKey, destinationURL: dest)
+            }
+            var out: [EngineResult<URL>] = []
+            for await r in group { out.append(r) }
+            return out
+        }
+        let successes = results.filter { if case .success = $0 { true } else { false } }.count
+        let destExists = results.filter { if case .failure(.destinationExists) = $0 { true } else { false } }.count
+        #expect(successes == 1, "exactly one concurrent publish may win (renamex_np RENAME_EXCL atomically)")
+        #expect(destExists == 1, "the loser must surface .destinationExists, never an overwrite")
+        #expect(results.allSatisfy {
+            if case .success = $0 { true } else if case .failure(.destinationExists) = $0 { true } else { false }
+        }, "every outcome must be success or destinationExists")
+
+        // The published destination is exactly ONE complete, uncorrupted plaintext.
+        let out = try Data(contentsOf: dest)
+        #expect(out == plainA || out == plainB, "the winner's output must be complete and never interleaved")
+        #expect(d.tempArtifacts().isEmpty, "neither the winner nor the loser may leave a staging temp")
+    }
+
+    @Test("after any failed run the destination directory contains no leftover .tmp files (D-08)")
+    func noLeftoverTempAfterFailures() async throws {
+        let d = SafeDir(); defer { d.cleanup() }
+        let input = d.file("in")
+        try pattern(ContainerCodec.defaultChunkLen + 100).write(to: input)
+        _ = try await PKCryptEngine.encrypt(fileURL: input, recipient: Fixtures.publicKey,
+                                            destinationURL: d.file("good.pkcrypt")).get()
+        var tampered = try Data(contentsOf: d.file("good.pkcrypt"))
+        tampered[tampered.count - 1] ^= 0xFF     // corrupt the final tag
+        try tampered.write(to: d.file("bad.pkcrypt"))
+
+        // (a) Collision: decrypt to a destination that already exists -> destinationExists.
+        let occupied = d.file("occupied")
+        try Data("occupied".utf8).write(to: occupied)
+        _ = await PKCryptEngine.decrypt(containerURL: d.file("good.pkcrypt"),
+                                        privateKey: Fixtures.privateKey, destinationURL: occupied)
+        // (b) Auth failure (tampered final tag).
+        _ = await PKCryptEngine.decrypt(containerURL: d.file("bad.pkcrypt"),
+                                        privateKey: Fixtures.privateKey, destinationURL: d.file("out"))
+        // (c) Cancellation.
+        let t: Task<EngineResult<URL>, Never> = Task {
+            await PKCryptEngine.decrypt(containerURL: d.file("good.pkcrypt"),
+                                        privateKey: Fixtures.privateKey, destinationURL: d.file("cancelled"))
+        }
+        t.cancel()
+        _ = await t.value
+
+        // After every failed run: zero stale .tmp artifacts remain (D-08).
+        #expect(d.tempArtifacts().isEmpty, "no failed run may leave a stale .tmp")
+        #expect(d.contains("occupied"), "a pre-existing destination is never touched")
+    }
 }
 
 // MARK: - Concurrency helpers (thread-safe, @unchecked Sendable for cross-closure capture)
