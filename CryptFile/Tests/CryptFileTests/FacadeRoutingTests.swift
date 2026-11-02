@@ -248,4 +248,64 @@ final class FacadeRoutingTests: XCTestCase {
                        "the first destination must never be overwritten/clobbered")
         XCTAssertNil(vm.errorTitle)
     }
+
+    // MARK: - Throttled progress bridge + cooperative cancel (SAFE-03, D-17/D-18)
+
+    /// The ProgressBridge coalesces engine @Sendable progress, preserving
+    /// monotonic bytesProcessed and forwarding the latest sample on the main actor.
+    func testProgressBridgeCoalescesAndPreservesMonotonicLatest() {
+        let bridge = ProgressBridge()
+        // An in-memory @Sendable producer stream of monotonically increasing bytes.
+        let updates: [EngineProgress] = [
+            .init(bytesProcessed: 0, totalBytes: 1000),
+            .init(bytesProcessed: 250, totalBytes: 1000),
+            .init(bytesProcessed: 500, totalBytes: 1000),
+            .init(bytesProcessed: 1000, totalBytes: 1000)
+        ]
+        for u in updates { bridge.record(u) }
+
+        // The first take() always forwards and must reflect the monotonic latest.
+        let first = bridge.take()
+        XCTAssertNotNil(first)
+        XCTAssertEqual(first?.bytesProcessed, 1000, "the bridge must forward the latest sample")
+
+        // Subsequent takes within the throttle window coalesce (nil)…
+        _ = bridge.take()
+        XCTAssertNil(bridge.take(), "within the throttle window the bridge must coalesce")
+
+        // …until the throttle interval elapses, when the newest reported value flows.
+        Thread.sleep(forTimeInterval: 0.06)   // > minInterval (0.04s)
+        bridge.record(.init(bytesProcessed: 1000, totalBytes: 1000))
+        let later = bridge.take()
+        XCTAssertNotNil(later, "after the throttle window the latest sample must forward")
+        XCTAssertGreaterThanOrEqual(later!.bytesProcessed, first!.bytesProcessed,
+                                    "bytesProcessed must never decrease across forwarded samples")
+    }
+
+    /// D-18 / FILE-03: cancelling a run mid-operation returns the tab to ready with
+    /// the inline "Cancelled" note and no destination published, and Run re-enables.
+    @MainActor
+    func testCancelMidRunReturnsToReadyWithNoDestination() async {
+        let dir = scratchDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let input = dir.appendingPathComponent("big.bin")
+        // Large enough that the engine is mid-stream when we cancel.
+        try! Data(repeating: 0x44, count: 64 * 1_048_576 + 1).write(to: input)
+
+        let vm = WorkflowViewModel()
+        vm.setMode(.encrypt)
+        vm.setInput(input)
+        vm.selectRecipient(try! KeySelection.detectAndParsePublic(TestFixtures.publicKeyData), summary: "Ed25519")
+        vm.setDestination(dir.appendingPathComponent("big.bin.pkcrypt"))
+
+        XCTAssertTrue(vm.canRun)
+        vm.run()
+        vm.cancel()                       // cooperative cancel between chunks
+        await vm.task?.value
+
+        XCTAssertFalse(vm.isRunning, "cancel must return the tab to ready (D-18)")
+        XCTAssertTrue(vm.didCancel, "cancel must surface the inline Cancelled note (D-20)")
+        XCTAssertNil(vm.outputPath, "cancel must NOT publish a destination")
+        XCTAssertNil(vm.errorTitle, "cancel is not an error banner")
+        XCTAssertTrue(vm.canRun, "Run must re-enable after cancel (D-21)")
+    }
 }
