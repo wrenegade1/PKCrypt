@@ -146,8 +146,20 @@ struct DecryptView: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard let data = try? Data(contentsOf: url) else { return }
         do {
-            let priv = try KeyMaterial.parseEd25519Private(data)
-            viewModel.selectPrivateKey(priv, summary: "Ed25519 private key")   // D-11 identity summary
+            let priv = try KeySelection.detectAndParsePrivate(data)
+            let comment = KeySelection.comment(of: data)
+            let fp = KeySelection.fingerprint(of: data)
+            let typeName: String
+            switch priv {
+            case .ed25519: typeName = "Ed25519"
+            case .rsa: typeName = "RSA"
+            }
+            // D-11 private-key identity summary: type + comment + truncated
+            // fingerprint — never the raw private key bytes (T-03-11).
+            var parts = ["\(typeName) private key"]
+            if let comment { parts.append("· \(comment)") }
+            parts.append("· \(fp)")
+            viewModel.selectPrivateKey(priv, summary: parts.joined(separator: " "))
         } catch let e as EngineError {
             viewModel.reportPickerError(e)   // D-13 passphrase guard via the D-20 seam
         } catch {

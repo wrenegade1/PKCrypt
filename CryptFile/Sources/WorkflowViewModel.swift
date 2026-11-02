@@ -22,9 +22,11 @@ final class WorkflowViewModel: ObservableObject {
     @Published var inputSummary: String?
     @Published var destination: URL?
 
-    // Parsed-key caches (keys are small; kept so a second run doesn't re-parse)
-    @Published var recipient: PublicKeyMaterial?
-    @Published var privateKey: PrivateKeyMaterial?
+    // Parsed-key caches (keys are small; kept so a second run doesn't re-parse).
+    // The union facade types (CryptRecipient/CryptPrivateKey) let both Ed25519
+    // and RSA flow through one normalized call (D-07 / FILE-01 / FILE-02).
+    @Published var recipient: CryptRecipient?
+    @Published var privateKey: CryptPrivateKey?
     @Published var keySummary: String?          // D-08 / D-11 identity summary
 
     // Run / feedback state
@@ -65,7 +67,7 @@ final class WorkflowViewModel: ObservableObject {
         resetFeedback()
     }
 
-    func selectRecipient(_ key: PublicKeyMaterial, summary: String?) {
+    func selectRecipient(_ key: CryptRecipient, summary: String?) {
         recipient = key
         keySummary = summary
         resetFeedback()
@@ -92,7 +94,7 @@ final class WorkflowViewModel: ObservableObject {
         errorDetail = msg.detail
     }
 
-    func selectPrivateKey(_ key: PrivateKeyMaterial, summary: String?) {
+    func selectPrivateKey(_ key: CryptPrivateKey, summary: String?) {
         privateKey = key
         keySummary = summary
         resetFeedback()
@@ -119,7 +121,7 @@ final class WorkflowViewModel: ObservableObject {
         task?.cancel()   // engine checks Task.checkCancellation() between chunks
     }
 
-    private func startEncrypt(input: URL, recipient: PublicKeyMaterial, destination: URL) {
+    private func startEncrypt(input: URL, recipient: CryptRecipient, destination: URL) {
         task = Task { @MainActor in
             let result = await PKCryptEngine.encrypt(
                 fileURL: input, recipient: recipient, destinationURL: destination
@@ -134,7 +136,7 @@ final class WorkflowViewModel: ObservableObject {
         }
     }
 
-    private func startDecrypt(container: URL, privateKey: PrivateKeyMaterial, destination: URL) {
+    private func startDecrypt(container: URL, privateKey: CryptPrivateKey, destination: URL) {
         task = Task { @MainActor in
             let result = await PKCryptEngine.decrypt(
                 containerURL: container, privateKey: privateKey, destinationURL: destination

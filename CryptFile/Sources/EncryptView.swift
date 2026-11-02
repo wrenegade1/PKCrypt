@@ -150,21 +150,25 @@ struct EncryptView: View {
         guard let data = try? Data(contentsOf: url) else { return }
         do {
             let recipient = try KeySelection.detectAndParsePublic(data)
+            let comment = KeySelection.comment(of: data)
+            let fp = KeySelection.fingerprint(of: data)
+            let typeName: String
             switch recipient {
-            case .ed25519(let mat):
-                let summary = KeySelection.comment(of: data).map { "Ed25519 · \($0)" } ?? "Ed25519 key"   // D-08
-                viewModel.selectRecipient(mat, summary: summary)
-            case .rsa(let mat):
-                // RSA recipient wiring + identity summary complete in Task 2
-                // (union state); keep Run disabled this wave (compile-cohesion
-                // interim so the tree builds after KeySelection returns the union).
-                _ = mat
-                viewModel.selectRecipientFailure()
+            case .ed25519: typeName = "Ed25519"
+            case .rsa: typeName = "RSA"
             }
+            // D-08 recipient identity summary: type + comment + truncated
+            // fingerprint — never the raw key bytes (T-03-11).
+            var parts = [typeName]
+            if let comment { parts.append("· \(comment)") }
+            parts.append("· \(fp)")
+            viewModel.selectRecipient(recipient, summary: parts.joined(separator: " "))
+        } catch let e as EngineError {
+            // D-12/D-13: an unknown/unsupported key surfaces inline via the D-20
+            // seam; Run stays disabled.
+            viewModel.reportPickerError(e)
         } catch {
-            // D-12: an unparseable key simply leaves Run disabled; the D-20 error
-            // banner path is exercised on engine failures and refined in Task 3.
-            viewModel.selectRecipientFailure()
+            viewModel.reportPickerError(.keyError("could not read the recipient key"))
         }
     }
 
