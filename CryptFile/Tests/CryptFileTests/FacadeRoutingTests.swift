@@ -87,11 +87,14 @@ final class FacadeRoutingTests: XCTestCase {
     }
 
     /// KeySelection.detectAndParsePublic delegates to the engine and returns the
-    /// parsed Ed25519 PublicKeyMaterial; comment(of:) extracts the D-08 identity
-    /// comment (the third+ whitespace token: `pkcrypt-engine-fixture@local`).
+    /// parsed Ed25519 PublicKeyMaterial (union .ed25519); comment(of:) extracts
+    /// the D-08 identity comment (the third+ whitespace token: `pkcrypt-engine-fixture@local`).
     func testKeySelectionParsesEd25519PublicAndComment() throws {
         let key = try KeySelection.detectAndParsePublic(TestFixtures.publicKeyData)
-        XCTAssertEqual(key.ed25519Public.count, 32)
+        guard case .ed25519(let mat) = key else {
+            return XCTFail("expected .ed25519, got \(key)")
+        }
+        XCTAssertEqual(mat.ed25519Public.count, 32)
         XCTAssertEqual(KeySelection.comment(of: TestFixtures.publicKeyData),
                        "pkcrypt-engine-fixture@local")
     }

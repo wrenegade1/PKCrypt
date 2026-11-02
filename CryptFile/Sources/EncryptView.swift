@@ -149,9 +149,18 @@ struct EncryptView: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard let data = try? Data(contentsOf: url) else { return }
         do {
-            let pub = try KeySelection.detectAndParsePublic(data)
-            let summary = KeySelection.comment(of: data).map { "Ed25519 · \($0)" } ?? "Ed25519 key"   // D-08
-            viewModel.selectRecipient(pub, summary: summary)
+            let recipient = try KeySelection.detectAndParsePublic(data)
+            switch recipient {
+            case .ed25519(let mat):
+                let summary = KeySelection.comment(of: data).map { "Ed25519 · \($0)" } ?? "Ed25519 key"   // D-08
+                viewModel.selectRecipient(mat, summary: summary)
+            case .rsa(let mat):
+                // RSA recipient wiring + identity summary complete in Task 2
+                // (union state); keep Run disabled this wave (compile-cohesion
+                // interim so the tree builds after KeySelection returns the union).
+                _ = mat
+                viewModel.selectRecipientFailure()
+            }
         } catch {
             // D-12: an unparseable key simply leaves Run disabled; the D-20 error
             // banner path is exercised on engine failures and refined in Task 3.
