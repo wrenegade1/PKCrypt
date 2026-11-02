@@ -11,58 +11,55 @@ import CryptoKit
 /// per-chunk progress through an optional `@Sendable` callback, and honors
 /// cooperative cancellation between chunks (`Task.checkCancellation()`): a
 /// cancelled operation aborts the staging temp and publishes nothing.
+/// Normalized recipient key-type union. The app passes ONE of these to the
+/// single union-based `encrypt` so the facade dispatches internally on the
+/// algorithm (Ed25519 vs RSA) — the app never touches codec internals.
+public enum CryptRecipient: Sendable {
+    case ed25519(PublicKeyMaterial)
+    case rsa(RSAPublicKeyMaterial)
+}
+
+/// Normalized private key-type union for the single union-based `decrypt`.
+public enum CryptPrivateKey: Sendable {
+    case ed25519(PrivateKeyMaterial)
+    case rsa(RSAPrivateKeyMaterial)
+}
+
 public enum PKCryptEngine {
 
     // MARK: - Encrypt
 
     /// Encrypt `fileURL` for an Ed25519 recipient, publishing a v2 AES-GCM
-    /// container to `destinationURL`. Publishes only after the whole stream is
-    /// sealed; an existing destination yields `.destinationExists` (D-10).
+    /// container to `destinationURL`. Thin delegate to the union path (Plan
+    /// 03-02 keeps the Ed25519-only overload for backward compatibility with
+    /// Plan 03-01's app trace).
     public static func encrypt(fileURL: URL,
                                recipient: PublicKeyMaterial,
                                destinationURL: URL,
                                progress: ProgressHandler? = nil) async -> EngineResult<URL> {
+        await encrypt(fileURL: fileURL, recipient: .ed25519(recipient),
+                      destinationURL: destinationURL, progress: progress)
+    }
+
+    /// Encrypt `fileURL` for a normalized `CryptRecipient` (.ed25519 -> v2
+    /// AES-GCM; .rsa -> v3 RSA-OAEP AES-GCM). Publishes only after the whole
+    /// stream is sealed; an existing destination yields `.destinationExists`
+    /// (D-10, no overwrite ever).
+    public static func encrypt(fileURL: URL,
+                               recipient: CryptRecipient,
+                               destinationURL: URL,
+                               progress: ProgressHandler? = nil) async -> EngineResult<URL> {
         do {
-            let recipientXPub = try KeyMaterial.x25519Public(fromEd25519: recipient.ed25519Public)
-
-            // Fresh ephemeral X25519 keypair + ECDH + HKDF (forward secrecy, T-02-04).
-            let ephPriv = Curve25519.KeyAgreement.PrivateKey()
-            let ephPub = ephPriv.publicKey.rawRepresentation
-            let shared = try ephPriv.sharedSecretFromKeyAgreement(
-                with: try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipientXPub)
-            )
-            let key = KeyMaterial.deriveKey(sharedSecret: shared.withUnsafeBytes { Data($0) },
-                                            ephemeralPublicKey: ephPub,
-                                            recipientXPublic: recipientXPub)
-
-            let cipher = ContainerCodec.cipherAES
-            let baseNonce = randomBytes(ContainerCodec.nonceAES)
-            let chunkLen = UInt32(ContainerCodec.defaultChunkLen)
-            let header = try V2Header(cipher: cipher, payloadType: ContainerCodec.payloadFile,
-                                      ephemeralPublicKey: ephPub, baseNonce: baseNonce, chunkLen: chunkLen).bytes
-
-            let publisher = SafeOutputPublisher(destinationURL: destinationURL)
-            let fh: FileHandle
-            do { fh = try publisher.start() } catch { throw error }
-            var processed: Int64 = 0
-            let total = fileSize(of: fileURL)
-            do {
-                try fh.write(contentsOf: header)
-                let crypto = AesGcmChunkCrypto(key: key, header: header, baseNonce: baseNonce, chunkLen: Int(chunkLen))
-                let enc = ChunkedEncryptor(crypto: crypto) { chunk in
-                    try Cancellation.checkChunkCancellation()   // D-16: between chunks
-                    processed += Int64(chunk.count)
-                    progress?(EngineProgress(bytesProcessed: processed, totalBytes: total))
-                    try fh.write(contentsOf: chunk)
-                }
-                try streamFilePieces(fileURL) { try enc.write($0) }
-                try enc.finish()
-                try publisher.publish(fh: fh)                  // only after full success
-                return .success(destinationURL)
-            } catch {
-                publisher.abort()                              // remove temp, publish nothing
-                throw error
+            let url: URL
+            switch recipient {
+            case .ed25519(let mat):
+                url = try encryptEd25519(fileURL: fileURL, recipient: mat,
+                                         destinationURL: destinationURL, progress: progress)
+            case .rsa(let mat):
+                url = try encryptRSA(fileURL: fileURL, recipient: mat,
+                                     destinationURL: destinationURL, progress: progress)
             }
+            return .success(url)
         } catch is CancellationError {
             return .failure(.cancelled)
         } catch let e as EngineError {
@@ -70,6 +67,65 @@ public enum PKCryptEngine {
         } catch {
             return .failure(.ioError(String(describing: error)))
         }
+    }
+
+    /// Ed25519 AES-GCM v2 encrypt body (shared by both overloads). Throws; the
+    /// caller applies the 3-way error fold.
+    private static func encryptEd25519(fileURL: URL, recipient: PublicKeyMaterial,
+                                       destinationURL: URL,
+                                       progress: ProgressHandler?) throws -> URL {
+        let recipientXPub = try KeyMaterial.x25519Public(fromEd25519: recipient.ed25519Public)
+
+        // Fresh ephemeral X25519 keypair + ECDH + HKDF (forward secrecy, T-02-04).
+        let ephPriv = Curve25519.KeyAgreement.PrivateKey()
+        let ephPub = ephPriv.publicKey.rawRepresentation
+        let shared = try ephPriv.sharedSecretFromKeyAgreement(
+            with: try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipientXPub)
+        )
+        let key = KeyMaterial.deriveKey(sharedSecret: shared.withUnsafeBytes { Data($0) },
+                                        ephemeralPublicKey: ephPub,
+                                        recipientXPublic: recipientXPub)
+
+        let cipher = ContainerCodec.cipherAES
+        let baseNonce = randomBytes(ContainerCodec.nonceAES)
+        let chunkLen = UInt32(ContainerCodec.defaultChunkLen)
+        let header = try V2Header(cipher: cipher, payloadType: ContainerCodec.payloadFile,
+                                  ephemeralPublicKey: ephPub, baseNonce: baseNonce, chunkLen: chunkLen).bytes
+
+        let publisher = SafeOutputPublisher(destinationURL: destinationURL)
+        let fh: FileHandle
+        do { fh = try publisher.start() } catch { throw error }
+        var processed: Int64 = 0
+        let total = fileSize(of: fileURL)
+        do {
+            try fh.write(contentsOf: header)
+            let crypto = AesGcmChunkCrypto(key: key, header: header, baseNonce: baseNonce, chunkLen: Int(chunkLen))
+            let enc = ChunkedEncryptor(crypto: crypto) { chunk in
+                try Cancellation.checkChunkCancellation()   // D-16: between chunks
+                processed += Int64(chunk.count)
+                progress?(EngineProgress(bytesProcessed: processed, totalBytes: total))
+                try fh.write(contentsOf: chunk)
+            }
+            try streamFilePieces(fileURL) { try enc.write($0) }
+            try enc.finish()
+            try publisher.publish(fh: fh)                  // only after full success
+            return destinationURL
+        } catch {
+            publisher.abort()                              // remove temp, publish nothing
+            throw error
+        }
+    }
+
+    /// RSA v3 encrypt body: a fresh random 32-byte session key wrapped via
+    /// `KeyMaterial.rsaWrap` (SecKey `.rsaEncryptionOAEPSHA256`; failure folds
+    /// into `authFailure`), then an AES-GCM chunked stream sealed into a v3
+    /// container and published only after full success.
+    private static func encryptRSA(fileURL: URL, recipient: RSAPublicKeyMaterial,
+                                   destinationURL: URL,
+                                   progress: ProgressHandler?) throws -> URL {
+        // RED stub — implemented in the GREEN commit.
+        _ = (fileURL, recipient, destinationURL, progress)
+        throw EngineError.ioError("RSA encrypt not implemented")
     }
 
     // MARK: - Decrypt
