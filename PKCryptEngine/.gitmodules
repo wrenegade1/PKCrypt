@@ -1,0 +1,15 @@
+# D-04 test-time oracle submodule (COMP-03).
+#
+# This PKCrypt repository is pulled in as a test-time git submodule under
+# PKCryptEngine/oracle-repo/ used ONLY by the PKCryptEngineTests target. The
+# production PKCryptEngine library has zero dependency on it. In this single-repo
+# plan-execution tree the directory is a documented dev-checkout stand-in (see
+# oracle-repo/README.md); in a standalone engine repo, `git submodule update --init`
+# populates it with the upstream PKCrypt source.
+#
+# The URL below is the canonical upstream fetch URL. Point it at the actual engine
+# repo's remote when the engine repo is materialized (see OracleRepo.resolve() /
+# oracle-repo/README.md for how the test target locates the oracle regardless).
+[submodule "oracle-repo"]
+	path = oracle-repo
+	url = https://github.com/user/PKCrypt.git
