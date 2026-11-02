@@ -58,4 +58,14 @@ The bidirectional differential matrix runs in-engine as the phase's primary veri
 Python/C++→Swift for Ed25519 × RSA-2048 × RSA-4096 × AES-GCM, plus XChaCha20 read via
 oracle-library-produced fixtures. CLI capability gaps (neither CLI exposes a cipher-select
 flag) are recorded `UNAVAILABLE(reason)`, never a pass and never silently skipped.
-(Full census for this plan is recorded at the bottom of `02-04-SUMMARY.md`.)
+
+**Final census (Plan 02-04):**
+
+| Metric | Count | Notes |
+|--------|------:|-------|
+| PASS  | 18 | 12 AES-GCM bidir cells (3 keys × 2 oracles × 2 directions) + 6 XChaCha20-read cells (3 keys × {empty, 1 MiB+1}) |
+| FAIL / mismatch | 0 | every runnable cell byte-compatible with both oracle CLIs |
+| UNAVAILABLE | 9 | CLI XChaCha-write (`no CLI cipher-select flag`, ×3 keys × python/cpp) + engine XChaCha-write (`engine never writes cipher 0x01`, ×3 keys) |
+
+An UNAVAILABLE cell is never counted as a pass and never silently skipped. If an oracle's
+C++ binary is absent, its cells are additionally recorded UNAVAILABLE, not failed.
