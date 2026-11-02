@@ -166,4 +166,135 @@ struct SafeOutputPublisherTests {
         #expect(try Data(contentsOf: dest) == Data("first".utf8), "the first result must never be overwritten")
         #expect(d.tempArtifacts().isEmpty)
     }
+
+    // MARK: - Task 2: public async Result API — progress & cooperative cancellation (D-12/D-15/D-16)
+
+    @Test("decrypt/encrypt return EngineResult (success/failure); no error throws escape the public API")
+    func resultContractNoThrow() async {
+        let d = SafeDir(); defer { d.cleanup() }
+        let input = d.file("in")
+        try! pattern(64).write(to: input)
+        let enc: EngineResult<URL> = await PKCryptEngine.encrypt(fileURL: input,
+                                                                  recipient: Fixtures.publicKey,
+                                                                  destinationURL: d.file("out.pkcrypt"))
+        #expect(enc == .success(d.file("out.pkcrypt")))
+        let dec: EngineResult<URL> = await PKCryptEngine.decrypt(containerURL: d.file("out.pkcrypt"),
+                                                                  privateKey: Fixtures.privateKey,
+                                                                  destinationURL: d.file("out"))
+        #expect(dec == .success(d.file("out")))
+        #expect(try! Data(contentsOf: d.file("out")) == pattern(64))
+    }
+
+    @Test("the progress callback fires at least once with monotonically non-decreasing bytesProcessed")
+    func progressMonotonic() async throws {
+        let d = SafeDir(); defer { d.cleanup() }
+        let big = 2 * ContainerCodec.defaultChunkLen + 100   // > 2 chunks so >1 callback
+        let input = d.file("in")
+        try pattern(big).write(to: input)
+        _ = try await PKCryptEngine.encrypt(fileURL: input, recipient: Fixtures.publicKey,
+                                            destinationURL: d.file("out.pkcrypt")).get()
+        let box = ProgressBox()
+        let result = await PKCryptEngine.decrypt(containerURL: d.file("out.pkcrypt"),
+                                                 privateKey: Fixtures.privateKey,
+                                                 destinationURL: d.file("out")) { p in
+            box.record(p)
+        }
+        #expect(result == .success(d.file("out")))
+        let samples = box.samples
+        #expect(samples.count >= 1, "the progress callback must fire at least once (per chunk)")
+        for i in 1 ..< samples.count {
+            #expect(samples[i].bytesProcessed >= samples[i - 1].bytesProcessed,
+                    "bytesProcessed must be monotonically non-decreasing")
+        }
+        #expect(samples.last?.totalBytes != nil, "totalBytes is known for a real file")
+    }
+
+    @Test("cancelling the operation mid-stream returns .failure(.cancelled), removes the temp, and publishes nothing")
+    func cancellationMidStream() async {
+        let d = SafeDir(); defer { d.cleanup() }
+        let big = 8 * ContainerCodec.defaultChunkLen   // 8 MiB -> many chunks
+        let input = d.file("in")
+        try! pattern(big).write(to: input)
+        _ = try! await PKCryptEngine.encrypt(fileURL: input, recipient: Fixtures.publicKey,
+                                             destinationURL: d.file("out.pkcrypt")).get()
+
+        let box = CancelBox()
+        let task: Task<EngineResult<URL>, Never> = Task {
+            await PKCryptEngine.decrypt(containerURL: d.file("out.pkcrypt"),
+                                        privateKey: Fixtures.privateKey,
+                                        destinationURL: d.file("out")) { _ in
+                // Cancel as soon as decryption has begun writing a chunk (D-16
+                // between-chunk checkpoint): the NEXT chunk observes the cancel.
+                box.cancel()
+            }
+        }
+        box.set(task)   // register immediately so the first-callback cancel lands
+        let result = await task.value
+        guard case .failure(let err) = result else {
+            Issue.record("expected .failure after cancellation, got \(result)")
+            return
+        }
+        #expect(err == .cancelled)
+        #expect(!FileManager.default.fileExists(atPath: d.file("out").path), "no destination may be published on cancel")
+        #expect(d.tempArtifacts().isEmpty, "cancel must remove the owning temp (D-08)")
+    }
+
+    @Test("an operation cancelled before it runs returns .failure(.cancelled) and publishes nothing")
+    func cancellationBeforeStart() async {
+        let d = SafeDir(); defer { d.cleanup() }
+        let input = d.file("in")
+        try! pattern(64).write(to: input)
+        _ = try! await PKCryptEngine.encrypt(fileURL: input, recipient: Fixtures.publicKey,
+                                             destinationURL: d.file("out.pkcrypt")).get()
+        let task: Task<EngineResult<URL>, Never> = Task {
+            await PKCryptEngine.decrypt(containerURL: d.file("out.pkcrypt"),
+                                        privateKey: Fixtures.privateKey,
+                                        destinationURL: d.file("out"))
+        }
+        task.cancel()
+        let result = await task.value
+        guard case .failure(let err) = result, err == .cancelled else {
+            Issue.record("expected .cancelled, got \(result)")
+            return
+        }
+        #expect(!FileManager.default.fileExists(atPath: d.file("out").path))
+        #expect(d.tempArtifacts().isEmpty)
+    }
+
+    @Test("crypto-stage failures surface as .failure(.authFailure) with no distinguishing detail and publish nothing")
+    func authFailureNoDetail() async throws {
+        let d = SafeDir(); defer { d.cleanup() }
+        var data = Fixtures.container("1MiBplus1")
+        data[data.count / 2] ^= 0x01   // flip one byte mid-body -> an AEAD chunk fails to authenticate
+        try data.write(to: d.file("tampered.pkcrypt"))
+        let result = await PKCryptEngine.decrypt(containerURL: d.file("tampered.pkcrypt"),
+                                                 privateKey: Fixtures.privateKey,
+                                                 destinationURL: d.file("out"))
+        guard case .failure(let err) = result else {
+            Issue.record("expected a crypto-stage failure, got success")
+            return
+        }
+        // Single generic authFailure, no distinguishing detail (D-11/D-13).
+        #expect(err == .authFailure)
+        #expect(!FileManager.default.fileExists(atPath: d.file("out").path), "no plaintext may be published")
+        #expect(d.tempArtifacts().isEmpty, "auth failure must remove the temp")
+    }
+}
+
+// MARK: - Concurrency helpers (thread-safe, @unchecked Sendable for cross-closure capture)
+
+/// Lets a test cancel its own operation from inside the engine's progress callback.
+final class CancelBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<EngineResult<URL>, Never>?
+    func set(_ t: Task<EngineResult<URL>, Never>) { lock.lock(); task = t; lock.unlock() }
+    func cancel() { lock.lock(); let t = task; lock.unlock(); t?.cancel() }
+}
+
+/// Records progress samples safely across the @Sendable progress callback.
+final class ProgressBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _samples: [EngineProgress] = []
+    var samples: [EngineProgress] { lock.lock(); defer { lock.unlock() }; return _samples }
+    func record(_ p: EngineProgress) { lock.lock(); _samples.append(p); lock.unlock() }
 }

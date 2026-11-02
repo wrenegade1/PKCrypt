@@ -163,11 +163,19 @@ public final class ChunkedEncryptor {
         pending.append(data)
         let cl = chunkLen
         let n = max(0, (pending.count - 1) / cl)   // (len-1)//cl hold-back rule
-        for i in 0 ..< n {
-            let block = Data(pending[i * cl ..< (i + 1) * cl])
-            try sink(try crypto.encryptChunk(block, final: false))
+        if n > 0 {
+            // Emit the (n) full non-final blocks. Use `subdata(in:)` (fresh copy)
+            // rather than `Data[...]`/`removeFirst` — after `removeFirst` the
+            // Data becomes a region/slice whose subsequent range-subscript can
+            // trap in Foundation (T-02-01 / crash on multi-chunk inputs).
+            for i in 0 ..< n {
+                let start = i * cl
+                let block = pending.subdata(in: start ..< (start + cl))
+                try sink(try crypto.encryptChunk(block, final: false))
+            }
+            let kept = n * cl
+            pending = pending.subdata(in: kept ..< pending.count)
         }
-        if n > 0 { pending.removeFirst(n * cl) }
     }
 
     public func finish() throws {
@@ -198,11 +206,18 @@ public final class ChunkedDecryptor {
             guard let piece = reader(), !piece.isEmpty else { break }
             pending.append(piece)
             let n = max(0, (pending.count - 1) / blockSize)
-            for i in 0 ..< n {
-                let block = Data(pending[i * blockSize ..< (i + 1) * blockSize])
-                try sink(try crypto.decryptChunk(block, final: false))
+            if n > 0 {
+                // Same fix as encrypt: use `subdata(in:)` (fresh copy) instead of
+                // `Data[...]`/`removeFirst` — a post-`removeFirst` region Data can
+                // trap on a later range-subscript in Foundation (T-02-01).
+                for i in 0 ..< n {
+                    let start = i * blockSize
+                    let block = pending.subdata(in: start ..< (start + blockSize))
+                    try sink(try crypto.decryptChunk(block, final: false))
+                }
+                let kept = n * blockSize
+                pending = pending.subdata(in: kept ..< pending.count)
             }
-            if n > 0 { pending.removeFirst(n * blockSize) }
         }
         // pending now holds the final block (0..blockSize bytes). The format
         // requires >= 1 chunk, so an empty trailing body is corrupt.

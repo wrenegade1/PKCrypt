@@ -249,16 +249,16 @@ struct FormatVectorTests {
     // MARK: committed oracle-produced containers decrypt to the deterministic plaintext
 
     @Test("decrypts oracle-produced containers at 0 / 1 MiB / 1 MiB+1")
-    func decryptOracleFixtures() throws {
+    func decryptOracleFixtures() async throws {
         let cases: [(String, Int)] = [("empty", 0), ("1MiB", 1 << 20), ("1MiBplus1", (1 << 20) + 1)]
         for (name, n) in cases {
             // Recreate the oracle container in a scratch file and decrypt it.
             let scratch = Scratch()
             defer { scratch.cleanup() }
             try Fixtures.container(name).write(to: scratch.container)
-            let result = PKCryptEngine.decrypt(containerURL: scratch.container,
-                                               privateKey: Fixtures.privateKey,
-                                               destinationURL: scratch.output)
+            let result = await PKCryptEngine.decrypt(containerURL: scratch.container,
+                                                     privateKey: Fixtures.privateKey,
+                                                     destinationURL: scratch.output)
             let recovered = try result.get()
             #expect(recovered == scratch.output)
             #expect(try Data(contentsOf: scratch.output) == pattern(n))
@@ -268,20 +268,20 @@ struct FormatVectorTests {
     // MARK: Swift self round-trip
 
     @Test("Swift encrypt then Swift decrypt round-trips at 0 / 1 MiB / 1 MiB+1")
-    func swiftSelfRoundTrip() throws {
+    func swiftSelfRoundTrip() async throws {
         for n in [0, 1 << 20, (1 << 20) + 1] {
             let scratch = Scratch()
             defer { scratch.cleanup() }
             let input = scratch.dir.appendingPathComponent("in")
             try pattern(n).write(to: input)
-            let enc = try PKCryptEngine.encrypt(fileURL: input,
-                                                 recipient: Fixtures.publicKey,
-                                                 destinationURL: scratch.container).get()
+            let enc = try await PKCryptEngine.encrypt(fileURL: input,
+                                                      recipient: Fixtures.publicKey,
+                                                      destinationURL: scratch.container).get()
             #expect(enc == scratch.container)
             #expect(try Data(contentsOf: scratch.container) != pattern(n))
-            let dec = try PKCryptEngine.decrypt(containerURL: scratch.container,
-                                                 privateKey: Fixtures.privateKey,
-                                                 destinationURL: scratch.output).get()
+            let dec = try await PKCryptEngine.decrypt(containerURL: scratch.container,
+                                                      privateKey: Fixtures.privateKey,
+                                                      destinationURL: scratch.output).get()
             #expect(dec == scratch.output)
             #expect(try Data(contentsOf: scratch.output) == pattern(n))
         }
@@ -290,16 +290,16 @@ struct FormatVectorTests {
     // MARK: truncation guard (minimal; full negative suite in Plan 04)
 
     @Test("decrypting a container with the final chunk cut returns authFailure and writes no destination")
-    func truncationGuard() throws {
+    func truncationGuard() async throws {
         // Cut 5 bytes off the committed 1MiB+1 container (corrupts the final chunk's tag).
         var data = Fixtures.container("1MiBplus1")
         data.removeLast(5)
         let scratch = Scratch()
         defer { scratch.cleanup() }
         try data.write(to: scratch.container)
-        let result = PKCryptEngine.decrypt(containerURL: scratch.container,
-                                           privateKey: Fixtures.privateKey,
-                                           destinationURL: scratch.output)
+        let result = await PKCryptEngine.decrypt(containerURL: scratch.container,
+                                                 privateKey: Fixtures.privateKey,
+                                                 destinationURL: scratch.output)
         guard case .failure(let err) = result else {
             Issue.record("expected authFailure, got success")
             return
@@ -468,13 +468,13 @@ struct FormatVectorTests {
     }
 
     @Test("the engine's public encrypt only writes AES-GCM (cipher 0x00); no XChaCha write path is exposed")
-    func noXChaChaWritePath() throws {
+    func noXChaChaWritePath() async throws {
         let scratch = Scratch()
         defer { scratch.cleanup() }
         let input = scratch.dir.appendingPathComponent("in")
         try pattern(16).write(to: input)
-        _ = try PKCryptEngine.encrypt(fileURL: input, recipient: Fixtures.publicKey,
-                                      destinationURL: scratch.container).get()
+        _ = try await PKCryptEngine.encrypt(fileURL: input, recipient: Fixtures.publicKey,
+                                            destinationURL: scratch.container).get()
         let data = try Data(contentsOf: scratch.container)
         #expect(data[ContainerCodec.magicBytes] == ContainerCodec.cipherAES,
                 "the only public encrypt emits cipher 0x00 (AES-GCM)")

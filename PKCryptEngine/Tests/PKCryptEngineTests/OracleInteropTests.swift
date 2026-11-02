@@ -132,14 +132,14 @@ struct OracleInteropTests {
     }
 
     @Test("Swift encrypts -> Python oracle decrypts to the same bytes", arguments: [0, 1 << 20, (1 << 20) + 1])
-    func swiftToOracle(size: Int) throws {
+    func swiftToOracle(size: Int) async throws {
         let scratch = Scratch()
         defer { scratch.cleanup() }
         let input = scratch.dir.appendingPathComponent("in")
         try pattern(size).write(to: input)
-        _ = try PKCryptEngine.encrypt(fileURL: input,
-                                      recipient: Self.publicKeyMaterial,
-                                      destinationURL: scratch.container).get()
+        _ = try await PKCryptEngine.encrypt(fileURL: input,
+                                            recipient: Self.publicKeyMaterial,
+                                            destinationURL: scratch.container).get()
         let (rc, out) = Self.runPython(Self.pythonScript, ["decrypt", scratch.container.path, Self.privKey.path])
         #expect(rc == 0, "oracle decrypt failed: \(out)")
         // oracle decrypts Swift's container; sha256 must equal our pattern's sha256.
@@ -147,14 +147,14 @@ struct OracleInteropTests {
     }
 
     @Test("Python oracle encrypts -> Swift decrypts to the same bytes", arguments: [0, 1 << 20, (1 << 20) + 1])
-    func oracleToSwift(size: Int) throws {
+    func oracleToSwift(size: Int) async throws {
         let scratch = Scratch()
         defer { scratch.cleanup() }
         let (rc, out) = Self.runPython(Self.pythonScript, ["encrypt", Self.pubKey.path, "\(size)", scratch.container.path])
         #expect(rc == 0, "oracle encrypt failed: \(out)")
-        let recovered = try PKCryptEngine.decrypt(containerURL: scratch.container,
-                                                  privateKey: Self.privateKeyMaterial,
-                                                  destinationURL: scratch.output).get()
+        let recovered = try await PKCryptEngine.decrypt(containerURL: scratch.container,
+                                                        privateKey: Self.privateKeyMaterial,
+                                                        destinationURL: scratch.output).get()
         #expect(recovered == scratch.output)
         #expect(try Data(contentsOf: scratch.output) == pattern(size))
     }

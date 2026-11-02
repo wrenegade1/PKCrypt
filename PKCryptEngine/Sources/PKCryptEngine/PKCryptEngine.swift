@@ -1,22 +1,27 @@
 import Foundation
 import CryptoKit
 
-/// Public facade for `PKCryptEngine` (D-01/D-03): the only entry surface Phase 3's
-/// app imports. Every encrypt/decrypt flows through ContainerCodec -> KeyMaterial
-/// -> ChunkedAEADStream -> SafeOutputPublisher — the app can never bypass the
-/// streaming/safety paths.
+/// Public facade for `PKCryptEngine` (D-01/D-03): the only entry surface Phase
+/// 3's app imports. Every encrypt/decrypt flows through ContainerCodec ->
+/// KeyMaterial -> ChunkedAEADStream -> SafeOutputPublisher — the app can never
+/// bypass the streaming/safety paths.
 ///
-/// Signatures are the tracer form; progress/cancellation and final API shape are
-/// finalized in Plan 03 (D-15/D-16). Output naming follows the caller-supplied
-/// destinationURL; no-replace publication returns `.destinationExists` on a
-/// collision (D-09/D-10).
+/// Finalized API (D-12/D-15/D-16): each operation is `async` and returns
+/// `EngineResult<T>` (no thrown error escapes the public surface), reports
+/// per-chunk progress through an optional `@Sendable` callback, and honors
+/// cooperative cancellation between chunks (`Task.checkCancellation()`): a
+/// cancelled operation aborts the staging temp and publishes nothing.
 public enum PKCryptEngine {
 
     // MARK: - Encrypt
 
-    /// Encrypt `fileURL` for an Ed25519 recipient, publishing a v2 AES-GCM container
-    /// to `destinationURL`. Returns the destination URL on success.
-    public static func encrypt(fileURL: URL, recipient: PublicKeyMaterial, destinationURL: URL) -> EngineResult<URL> {
+    /// Encrypt `fileURL` for an Ed25519 recipient, publishing a v2 AES-GCM
+    /// container to `destinationURL`. Publishes only after the whole stream is
+    /// sealed; an existing destination yields `.destinationExists` (D-10).
+    public static func encrypt(fileURL: URL,
+                               recipient: PublicKeyMaterial,
+                               destinationURL: URL,
+                               progress: ProgressHandler? = nil) async -> EngineResult<URL> {
         do {
             let recipientXPub = try KeyMaterial.x25519Public(fromEd25519: recipient.ed25519Public)
 
@@ -39,18 +44,27 @@ public enum PKCryptEngine {
             let publisher = SafeOutputPublisher(destinationURL: destinationURL)
             let fh: FileHandle
             do { fh = try publisher.start() } catch { throw error }
+            var processed: Int64 = 0
+            let total = fileSize(of: fileURL)
             do {
                 try fh.write(contentsOf: header)
                 let crypto = AesGcmChunkCrypto(key: key, header: header, baseNonce: baseNonce, chunkLen: Int(chunkLen))
-                let enc = ChunkedEncryptor(crypto: crypto) { try fh.write(contentsOf: $0) }
+                let enc = ChunkedEncryptor(crypto: crypto) { chunk in
+                    try Cancellation.checkChunkCancellation()   // D-16: between chunks
+                    processed += Int64(chunk.count)
+                    progress?(EngineProgress(bytesProcessed: processed, totalBytes: total))
+                    try fh.write(contentsOf: chunk)
+                }
                 try streamFilePieces(fileURL) { try enc.write($0) }
                 try enc.finish()
-                try publisher.publish(fh: fh)
+                try publisher.publish(fh: fh)                  // only after full success
                 return .success(destinationURL)
             } catch {
-                publisher.abort()
+                publisher.abort()                              // remove temp, publish nothing
                 throw error
             }
+        } catch is CancellationError {
+            return .failure(.cancelled)
         } catch let e as EngineError {
             return .failure(e)
         } catch {
@@ -62,11 +76,16 @@ public enum PKCryptEngine {
 
     /// Decrypt a v2 Ed25519 AES-GCM container to `destinationURL` using the
     /// recipient's private key material. Publishes ONLY after the whole AEAD
-    /// stream authenticates (SAFE-01).
-    public static func decrypt(containerURL: URL, privateKey: PrivateKeyMaterial, destinationURL: URL) -> EngineResult<URL> {
+    /// stream authenticates (SAFE-01); an existing destination is never
+    /// overwritten (`.destinationExists`, D-10).
+    public static func decrypt(containerURL: URL,
+                               privateKey: PrivateKeyMaterial,
+                               destinationURL: URL,
+                               progress: ProgressHandler? = nil) async -> EngineResult<URL> {
         do {
             let reader = try FileHandle(forReadingFrom: containerURL)
             defer { try? reader.close() }
+            let containerSize = fileSize(of: containerURL)
 
             let prefix = try reader.read(upToCount: ContainerCodec.prefixBytes) ?? Data()
             guard prefix.count >= ContainerCodec.prefixBytes else {
@@ -89,24 +108,32 @@ public enum PKCryptEngine {
             let xPriv = KeyMaterial.x25519Private(fromSeed: privateKey.seed, ed25519Public: privateKey.ed25519Public)
             let xPub = try KeyMaterial.x25519Public(fromEd25519: privateKey.ed25519Public)
             let shared = try KeyMaterial.sharedSecret(x25519Private: xPriv, ephemeralPublic: v2.ephemeralPublicKey)
-            let key = KeyMaterial.deriveKey(sharedSecret: shared, ephemeralPublicKey: v2.ephemeralPublicKey, recipientXPublic: xPub)
+            let key = KeyMaterial.deriveKey(sharedSecret: shared, ephemeralPublicKey: v2.ephemeralPublicKey,
+                                            recipientXPublic: xPub)
 
             let publisher = SafeOutputPublisher(destinationURL: destinationURL)
             let fh: FileHandle
             do { fh = try publisher.start() } catch { throw error }
+            var processed: Int64 = 0
+            let total = max(0, containerSize - Int64(headerSize))
             do {
                 let crypto = AesGcmChunkCrypto(key: key, header: header, baseNonce: v2.baseNonce, chunkLen: Int(v2.chunkLen))
                 let dec = ChunkedDecryptor(crypto: crypto)
                 let blockSize = dec.blockSize
                 try dec.run(reader: { try? reader.read(upToCount: blockSize) }) { plain in
+                    try Cancellation.checkChunkCancellation()   // D-16: between chunks
+                    processed += Int64(plain.count)
+                    progress?(EngineProgress(bytesProcessed: processed, totalBytes: total))
                     try fh.write(contentsOf: plain)
                 }
-                try publisher.publish(fh: fh)
+                try publisher.publish(fh: fh)                  // only after full authentication
                 return .success(destinationURL)
             } catch {
-                publisher.abort()
+                publisher.abort()                              // remove temp, publish nothing
                 throw error
             }
+        } catch is CancellationError {
+            return .failure(.cancelled)
         } catch let e as EngineError {
             return .failure(e)
         } catch {
@@ -128,6 +155,12 @@ public enum PKCryptEngine {
             if piece.isEmpty { break }
             try body(piece)
         }
+    }
+
+    /// Byte count of a file on disk, or 0 if it cannot be stat'd (used only as a
+    /// best-effort progress `totalBytes`).
+    private static func fileSize(of url: URL) -> Int64 {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
     }
 
     /// Cryptographically random bytes (SystemRandomNumberGenerator is CSPRNG-backed
