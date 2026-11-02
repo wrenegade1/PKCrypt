@@ -60,12 +60,26 @@ final class WorkflowViewModel: ObservableObject {
     func setInput(_ url: URL) {
         inputURL = url
         inputSummary = url.lastPathComponent
+        persistGranted(url, scope: .input)
         resetFeedback()
     }
 
     func setDestination(_ url: URL) {
         destination = url
+        persistGranted(url, scope: .destination)
         resetFeedback()
+    }
+
+    /// Best-effort persistence of a user-granted URL as an app-scoped security-scoped
+    /// bookmark (APP-03 / D-05). Non-fatal: if the URL can't be bookmarked (e.g. a
+    /// derived default path that was never a panel grant) we simply don't persist it
+    /// and fall back to the in-memory URL. Keys/ciphertext are never stored — only
+    /// bookmark data.
+    func persistGranted(_ url: URL, scope: SecurityScopedAccess.Scope) {
+        try? SecurityScopedAccess.persistBookmark(
+            for: url,
+            key: SecurityScopedAccess.bookmarkKey(for: scope)
+        )
     }
 
     func selectRecipient(_ key: CryptRecipient, summary: String?) {
@@ -134,32 +148,54 @@ final class WorkflowViewModel: ObservableObject {
     }
 
     private func startEncrypt(input: URL, recipient: CryptRecipient, destination: URL) {
+        // APP-03 / D-05: every URL the engine touches (input + destination) is used
+        // inside a balanced start/stop security scope (Pitfall 1 / T-03-15) — never
+        // outside one. The in-memory URL is authoritative in-session (the D-16
+        // run(toAlt:) flow replaces it); bookmark persistence handles relaunch, it
+        // does not substitute the run URL.
         task = Task { @MainActor in
-            let result = await PKCryptEngine.encrypt(
-                fileURL: input, recipient: recipient, destinationURL: destination
-            ) { [bridge] p in
-                bridge.record(p)
-                Task { @MainActor [weak self] in
-                    guard let self, let sample = bridge.take() else { return }
-                    self.updateProgress(sample)
+            do {
+                let result = try await SecurityScopedAccess.access(destination) { (dest: URL) async throws -> EngineResult<URL> in
+                    try await SecurityScopedAccess.access(input) { (input: URL) async throws -> EngineResult<URL> in
+                        await PKCryptEngine.encrypt(
+                            fileURL: input, recipient: recipient, destinationURL: dest
+                        ) { [bridge] p in
+                            bridge.record(p)
+                            Task { @MainActor [weak self] in
+                                guard let self, let sample = bridge.take() else { return }
+                                self.updateProgress(sample)
+                            }
+                        }
+                    }
                 }
+                self.apply(result)
+            } catch {
+                // A false access start fails fast (Pitfall 1 / T-03-15).
+                self.apply(.failure(error is EngineError ? error as! EngineError : .permissionError("could not start scoped access")))
             }
-            self.apply(result)
         }
     }
 
     private func startDecrypt(container: URL, privateKey: CryptPrivateKey, destination: URL) {
         task = Task { @MainActor in
-            let result = await PKCryptEngine.decrypt(
-                containerURL: container, privateKey: privateKey, destinationURL: destination
-            ) { [bridge] p in
-                bridge.record(p)
-                Task { @MainActor [weak self] in
-                    guard let self, let sample = bridge.take() else { return }
-                    self.updateProgress(sample)
+            do {
+                let result = try await SecurityScopedAccess.access(destination) { (dest: URL) async throws -> EngineResult<URL> in
+                    try await SecurityScopedAccess.access(container) { (input: URL) async throws -> EngineResult<URL> in
+                        await PKCryptEngine.decrypt(
+                            containerURL: input, privateKey: privateKey, destinationURL: dest
+                        ) { [bridge] p in
+                            bridge.record(p)
+                            Task { @MainActor [weak self] in
+                                guard let self, let sample = bridge.take() else { return }
+                                self.updateProgress(sample)
+                            }
+                        }
+                    }
                 }
+                self.apply(result)
+            } catch {
+                self.apply(.failure(error is EngineError ? error as! EngineError : .permissionError("could not start scoped access")))
             }
-            self.apply(result)
         }
     }
 

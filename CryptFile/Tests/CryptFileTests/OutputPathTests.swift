@@ -32,4 +32,56 @@ final class OutputPathTests: XCTestCase {
         XCTAssertEqual(OutputPath.destination(decrypting: dir.appendingPathComponent("x.pkcrypt")).path,
                        dir.appendingPathComponent("x").path)
     }
+
+    // MARK: - Security-scoped bookmark lifecycle (APP-03 / D-05)
+
+    /// A temporary URL round-trips `persistBookmark` → `resolveBookmark` through
+    /// UserDefaults with the same path (non-stale), and `access(_:)` returns the
+    /// closure's value with a balanced start/stop scope (Pitfall 1 / T-03-15).
+    func testBookmarkStoreResolveRoundTripOnTempURL() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("scoped-\(UUID().uuidString).bin")
+        try! Data("bookmark-payload".utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let key = "test.bookmark.\(UUID().uuidString)"
+        // Clean any prior value for a stable baseline.
+        UserDefaults.standard.removeObject(forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        XCTAssertNoThrow(try SecurityScopedAccess.persistBookmark(for: url, key: key))
+        let stored = UserDefaults.standard.data(forKey: key)
+        XCTAssertNotNil(stored, "persistBookmark must write bookmark data to UserDefaults")
+
+        let resolved = SecurityScopedAccess.resolveBookmark(for: key)
+        XCTAssertNotNil(resolved, "resolveBookmark must recover a URL")
+        XCTAssertEqual(resolved!.path, url.path, "resolve must recover the same URL (non-stale)")
+
+        // access(_:) runs the closure inside a balanced start/stop scope and returns
+        // its value.
+        let value = SecurityScopedAccess.access(resolved!) { scoped in
+            XCTAssertEqual(scoped.path, url.path, "access must hand the resolved URL to the closure")
+            return 42
+        }
+        XCTAssertEqual(value, 42, "access must return the closure's value")
+    }
+
+    /// The WorkflowViewModel best-effort persistence helper persists a granted URL
+    /// and resolves it back to the same path (best-effort, non-fatal).
+    @MainActor
+    func testViewModelPersistGrantedWritesAndResolvesBookmark() {
+        let vm = WorkflowViewModel()
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("granted-\(UUID().uuidString).txt")
+        try! Data("hi".utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let key = SecurityScopedAccess.bookmarkKey(for: .input)
+        UserDefaults.standard.removeObject(forKey: key)
+        vm.persistGranted(url, scope: .input)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        let resolved = SecurityScopedAccess.resolveBookmark(for: key)
+        XCTAssertEqual(resolved?.path, url.path, "the granted URL must be persistable + resolvable")
+    }
 }
