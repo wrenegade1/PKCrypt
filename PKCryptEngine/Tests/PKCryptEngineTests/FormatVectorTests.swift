@@ -141,6 +141,54 @@ enum RSAPipe {
     }
 }
 
+/// Decrypt helpers for cipher-0x01 (XChaCha20-Poly1305) containers, routing
+/// exclusively through libsodium via `XChaCha20ChunkCrypto` (24-byte nonce).
+enum XCPipe {
+    /// Decrypt a v2 (Ed25519) XChaCha container: ECDH+HKDF key, then XChaCha.
+    static func decryptEd25519(_ container: Data, priv: PrivateKeyMaterial) throws -> Data {
+        let cipher = container[ContainerCodec.magicBytes]
+        guard cipher == ContainerCodec.cipherXChaCha20 else {
+            throw EngineError.unsupportedFormat("not an XChaCha20 container")
+        }
+        let headerSize = ContainerCodec.prefixBytes + ContainerCodec.ephPubBytes
+            + ContainerCodec.nonceXC + ContainerCodec.chunkLenBytes
+        let header = Data(container.prefix(headerSize))
+        let v2 = try V2Header.parse(header)
+        let xPriv = KeyMaterial.x25519Private(fromSeed: priv.seed, ed25519Public: priv.ed25519Public)
+        let xPub = try KeyMaterial.x25519Public(fromEd25519: priv.ed25519Public)
+        let shared = try KeyMaterial.sharedSecret(x25519Private: xPriv, ephemeralPublic: v2.ephemeralPublicKey)
+        let key = KeyMaterial.deriveKey(sharedSecret: shared, ephemeralPublicKey: v2.ephemeralPublicKey,
+                                        recipientXPublic: xPub)
+        let crypto = XChaCha20ChunkCrypto(key: key, header: header, baseNonce: v2.baseNonce,
+                                          chunkLen: Int(v2.chunkLen))
+        return try run(crypto, container: container, headerSize: headerSize)
+    }
+
+    /// Decrypt a v3 (RSA) XChaCha container: OAEP-unwrapped session key, then XChaCha.
+    static func decryptRSA(_ container: Data, priv: RSAPrivateKeyMaterial) throws -> Data {
+        let rsaHeader = try RSAHeader.parse(container, modulusBytes: priv.modulusBytes)
+        let sessionKey = try KeyMaterial.rsaUnwrap(wrapped: rsaHeader.wrappedKey, privateKey: priv)
+        let headerSize = RSAHeader.headerSize(nonceLen: rsaHeader.baseNonce.count, modulusBytes: priv.modulusBytes)
+        let header = Data(container.prefix(headerSize))
+        let crypto = XChaCha20ChunkCrypto(key: sessionKey, header: header, baseNonce: rsaHeader.baseNonce,
+                                          chunkLen: Int(rsaHeader.chunkLen))
+        return try run(crypto, container: container, headerSize: headerSize)
+    }
+
+    private static func run(_ crypto: any ChunkDecrypting, container: Data,
+                            headerSize: Int) throws -> Data {
+        let dec = ChunkedDecryptor(crypto: crypto)
+        var out = Data()
+        var first = true
+        let body = Data(container[headerSize...])
+        try dec.run(reader: {
+            if first { first = false; return body }
+            return nil
+        }) { out.append($0) }
+        return out
+    }
+}
+
 // MARK: - Format vectors (deterministic byte-exactness)
 
 @Suite("FormatVectorTests")
@@ -367,6 +415,69 @@ struct FormatVectorTests {
         #expect(h1.wrappedKey != h2.wrappedKey,
                 "a fresh random 32-byte session key per encrypt must produce different wrapped keys")
         #expect(c1 != c2, "different session keys/nonces must produce different full containers")
+    }
+
+    // MARK: XChaCha20-Poly1305 read path (cipher 0x01, 24-byte nonce)
+
+    @Test("cipher 0x01 parses with a 24-byte base nonce and routes to the libsodium XChaCha path")
+    func xchachaCipherRoute() throws {
+        let ed = Fixtures.container("xc_ed_empty")
+        let rsa = Fixtures.rsaContainer("rsa2048_xc_empty")
+        for c in [ed, rsa] {
+            #expect(c[ContainerCodec.magicBytes] == ContainerCodec.cipherXChaCha20)
+            // 24-byte nonce, not 12.
+            let nonceLen = try ContainerCodec.nonceLen(forCipher: c[ContainerCodec.magicBytes])
+            #expect(nonceLen == ContainerCodec.nonceXC && nonceLen != ContainerCodec.nonceAES)
+        }
+        // Ed25519 v2 header carries a 24-byte base nonce.
+        let v2 = try V2Header.parse(Data(ed.prefix(ContainerCodec.prefixBytes + ContainerCodec.ephPubBytes
+            + ContainerCodec.nonceXC + ContainerCodec.chunkLenBytes)))
+        #expect(v2.baseNonce.count == 24)
+        // RSA v3 header carries a 24-byte base nonce.
+        let rh = try RSAHeader.parse(rsa, modulusBytes: Fixtures.rsa2048Material.modulusBytes)
+        #expect(rh.baseNonce.count == 24)
+    }
+
+    @Test("per-chunk XChaCha nonce = 24-byte base nonce with the last 4 bytes replaced by the BE index")
+    func xchachaNonceVector() throws {
+        // 24-byte base: 0x21..0x38.
+        let base = Data((0x21 ... 0x38).map { UInt8($0) })
+        // First 20 bytes stay, last 4 (0x35..0x38) are replaced.
+        let prefix = "2122232425262728292a2b2c2d2e2f3031323334"
+        #expect(ContainerCodec.chunkNonce(baseNonce: base, index: 0).hexString == prefix + "00000000")
+        #expect(ContainerCodec.chunkNonce(baseNonce: base, index: 1).hexString == prefix + "00000001")
+        #expect(ContainerCodec.chunkNonce(baseNonce: base, index: 0x01020304).hexString == prefix + "01020304")
+    }
+
+    @Test("decrypts oracle-produced XChaCha20 v2 (Ed25519) containers at 0 / 1 MiB / 1 MiB+1")
+    func decryptOracleXcEd25519() throws {
+        for (suffix, n) in [("empty", 0), ("1MiB", 1 << 20), ("1MiBplus1", (1 << 20) + 1)] {
+            let container = Fixtures.container("xc_ed_\(suffix)")
+            let recovered = try XCPipe.decryptEd25519(container, priv: Fixtures.privateKey)
+            #expect(recovered == pattern(n), "xc_ed \(suffix) recovered != original")
+        }
+    }
+
+    @Test("decrypts oracle-produced XChaCha20 v3 (RSA) containers")
+    func decryptOracleXcRsa() throws {
+        for (suffix, n) in [("empty", 0), ("1MiB", 1 << 20), ("1MiBplus1", (1 << 20) + 1)] {
+            let container = Fixtures.rsaContainer("rsa2048_xc_\(suffix)")
+            let recovered = try XCPipe.decryptRSA(container, priv: Fixtures.rsa2048Material)
+            #expect(recovered == pattern(n), "rsa2048_xc \(suffix) recovered != original")
+        }
+    }
+
+    @Test("the engine's public encrypt only writes AES-GCM (cipher 0x00); no XChaCha write path is exposed")
+    func noXChaChaWritePath() throws {
+        let scratch = Scratch()
+        defer { scratch.cleanup() }
+        let input = scratch.dir.appendingPathComponent("in")
+        try pattern(16).write(to: input)
+        _ = try PKCryptEngine.encrypt(fileURL: input, recipient: Fixtures.publicKey,
+                                      destinationURL: scratch.container).get()
+        let data = try Data(contentsOf: scratch.container)
+        #expect(data[ContainerCodec.magicBytes] == ContainerCodec.cipherAES,
+                "the only public encrypt emits cipher 0x00 (AES-GCM)")
     }
 }
 
