@@ -203,4 +203,49 @@ final class FacadeRoutingTests: XCTestCase {
         XCTAssertFalse(summary.contains(line),
                        "identity summary must never include the raw key line/blob (T-03-11)")
     }
+
+    // MARK: - D-16 destinationExists → alternate-destination flow (Task 3)
+
+    /// D-16 / SAFE-02: a real `.destinationExists` collision enters the
+    /// alternate-destination state (NOT failure, NOT overwrite); a second run to
+    /// a fresh destination publishes there and never clobbers the first file.
+    @MainActor
+    func testDestinationExistsEntersAlternateFlowThenRunsToAlternate() async {
+        let dir = scratchDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let input = dir.appendingPathComponent("in.bin")
+        let payload = Data(repeating: 0x41, count: 256)
+        try! payload.write(to: input)
+
+        let vm = WorkflowViewModel()
+        vm.setMode(.encrypt)
+        vm.setInput(input)
+        vm.selectRecipient(try! KeySelection.detectAndParsePublic(TestFixtures.publicKeyData), summary: "Ed25519")
+
+        // Pre-existing destination -> first run must collide.
+        let first = dir.appendingPathComponent("in.bin.pkcrypt")
+        try! Data("occupied".utf8).write(to: first)
+        vm.setDestination(first)
+
+        vm.run()
+        await vm.task?.value
+
+        XCTAssertTrue(vm.pendingAlternateDestination,
+                      "a collision must enter the alternate-destination state (D-16)")
+        XCTAssertNil(vm.outputPath, "no destination may be published on a collision")
+        XCTAssertNil(vm.errorTitle, "a collision is not an error banner")
+        XCTAssertEqual(try! Data(contentsOf: first), Data("occupied".utf8),
+                       "the existing destination must stay untouched (no overwrite)")
+
+        // Re-run to a fresh alternate destination — same selections, new path.
+        let alt = dir.appendingPathComponent("alternate.pkcrypt")
+        vm.run(toAlt: alt)
+        await vm.task?.value
+
+        XCTAssertEqual(vm.outputPath, alt.path, "the alternate re-run must publish there")
+        XCTAssertFalse(vm.pendingAlternateDestination, "the D-16 state resets after a successful alternate run")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: alt.path))
+        XCTAssertEqual(try! Data(contentsOf: first), Data("occupied".utf8),
+                       "the first destination must never be overwritten/clobbered")
+        XCTAssertNil(vm.errorTitle)
+    }
 }

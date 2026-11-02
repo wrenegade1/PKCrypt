@@ -37,8 +37,9 @@ final class WorkflowViewModel: ObservableObject {
     @Published private(set) var errorTitle: String?
     @Published private(set) var errorDetail: String?
     @Published private(set) var didCancel = false
+    @Published private(set) var pendingAlternateDestination = false   // D-16 prompt state
 
-    private var task: Task<Void, Never>?
+    var task: Task<Void, Never>?
     private let bridge = ProgressBridge()
 
     var canRun: Bool {
@@ -121,6 +122,17 @@ final class WorkflowViewModel: ObservableObject {
         task?.cancel()   // engine checks Task.checkCancellation() between chunks
     }
 
+    /// D-16: after a `.destinationExists` collision the user picks an alternate
+    /// destination and we re-run the SAME operation there. Never renames the
+    /// staged temp and never overwrites (Pitfall 5 / SAFE-02); the user's other
+    /// selections are kept in context (D-02).
+    func run(toAlt destination: URL) {
+        guard pendingAlternateDestination, !isRunning else { return }
+        self.destination = destination
+        pendingAlternateDestination = false
+        run()
+    }
+
     private func startEncrypt(input: URL, recipient: CryptRecipient, destination: URL) {
         task = Task { @MainActor in
             let result = await PKCryptEngine.encrypt(
@@ -165,9 +177,17 @@ final class WorkflowViewModel: ObservableObject {
             fraction = 1.0
             progressText = nil
         case .failure(let error):
-            if error == .cancelled {
-                didCancel = true
-            } else {
+            switch error {
+            case .destinationExists:
+                // D-16: block the run and prompt for an alternate destination —
+                // never overwrite or auto-rename (Pitfall 5 / SAFE-02). The user's
+                // selections stay in context so they can re-run via run(toAlt:).
+                pendingAlternateDestination = true
+            case .cancelled:
+                didCancel = true   // tab returns to ready with an inline "Cancelled" note (D-20)
+            default:
+                // Every remaining case through the D-20 seam: authFailure stays
+                // generic, typed cases surface detail.
                 let msg = UserMessage.message(for: error)
                 errorTitle = msg.title
                 errorDetail = msg.detail
@@ -183,5 +203,6 @@ final class WorkflowViewModel: ObservableObject {
         errorTitle = nil
         errorDetail = nil
         didCancel = false
+        pendingAlternateDestination = false
     }
 }

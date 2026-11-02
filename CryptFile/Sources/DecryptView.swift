@@ -103,6 +103,15 @@ struct DecryptView: View {
     @ViewBuilder private var resultSection: some View {
         if viewModel.didCancel {
             Text("Cancelled").font(.callout).foregroundStyle(.secondary)
+        } else if viewModel.pendingAlternateDestination {
+            // D-16: block + prompt for an alternate destination (no overwrite).
+            VStack(alignment: .leading, spacing: 6) {
+                Text("File already exists").font(.headline).foregroundStyle(.orange)
+                Text("Nothing was overwritten. Choose a different name or location.")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                Button("Choose alternate location…") { chooseAlternateDestination() }
+            }
         } else if let title = viewModel.errorTitle {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.headline).foregroundStyle(.red)
@@ -174,5 +183,16 @@ struct DecryptView: View {
         panel.nameFieldStringValue = defaultURL.lastPathComponent
         guard panel.runModal() == .OK, let url = panel.url else { return }
         viewModel.setDestination(url)
+    }
+
+    /// D-16: after a destination collision, choose a fresh alternate path and
+    /// re-run the same operation there (no overwrite, no auto-rename).
+    private func chooseAlternateDestination() {
+        let panel = NSSavePanel()
+        panel.title = "Choose an alternate destination"
+        panel.directoryURL = viewModel.destination?.deletingLastPathComponent()
+        panel.nameFieldStringValue = viewModel.destination?.lastPathComponent ?? "output"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        viewModel.run(toAlt: url)
     }
 }
