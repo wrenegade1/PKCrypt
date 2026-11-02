@@ -162,64 +162,44 @@ public enum PKCryptEngine {
 
     // MARK: - Decrypt
 
-    /// Decrypt a v2 Ed25519 AES-GCM container to `destinationURL` using the
-    /// recipient's private key material. Publishes ONLY after the whole AEAD
-    /// stream authenticates (SAFE-01); an existing destination is never
-    /// overwritten (`.destinationExists`, D-10).
+    /// Decrypt a container for an Ed25519 private key. Thin delegate to the
+    /// union path (Plan 03-02 compatibility overload).
     public static func decrypt(containerURL: URL,
                                privateKey: PrivateKeyMaterial,
                                destinationURL: URL,
                                progress: ProgressHandler? = nil) async -> EngineResult<URL> {
+        await decrypt(containerURL: containerURL, privateKey: .ed25519(privateKey),
+                      destinationURL: destinationURL, progress: progress)
+    }
+
+    /// Decrypt a container for a normalized `CryptPrivateKey` (.ed25519 / .rsa).
+    /// Dispatches on the 8-byte container magic (PKCRYPT\\x02 -> v2 Ed25519,
+    /// PKCRYPT\\x03 -> v3 RSA) — a magic/key algorithm mismatch is a typed,
+    /// non-leaking `unsupportedFormat`, NOT `authFailure` (PITFALL #10). Publishes
+    /// only after the whole AEAD stream authenticates; never overwrites.
+    public static func decrypt(containerURL: URL,
+                               privateKey: CryptPrivateKey,
+                               destinationURL: URL,
+                               progress: ProgressHandler? = nil) async -> EngineResult<URL> {
         do {
-            let reader = try FileHandle(forReadingFrom: containerURL)
-            defer { try? reader.close() }
-            let containerSize = fileSize(of: containerURL)
-
-            let prefix = try reader.read(upToCount: ContainerCodec.prefixBytes) ?? Data()
-            guard prefix.count >= ContainerCodec.prefixBytes else {
-                throw EngineError.unsupportedFormat("encrypted payload too short or corrupt")
-            }
-            let cipher = prefix[ContainerCodec.magicBytes]
-            let nonceLen = try ContainerCodec.nonceLen(forCipher: cipher)
-            let headerSize = ContainerCodec.prefixBytes + ContainerCodec.ephPubBytes + nonceLen + ContainerCodec.chunkLenBytes
-            var header = prefix
-            if header.count < headerSize {
-                let rest = try reader.read(upToCount: headerSize - header.count) ?? Data()
-                header.append(rest)
-            }
-            guard header.count >= headerSize else {
-                throw EngineError.unsupportedFormat("encrypted payload too short or corrupt")
-            }
-            let v2 = try V2Header.parse(header)
-
-            // Key establishment (Ed25519 -> X25519 -> ECDH -> HKDF).
-            let xPriv = KeyMaterial.x25519Private(fromSeed: privateKey.seed, ed25519Public: privateKey.ed25519Public)
-            let xPub = try KeyMaterial.x25519Public(fromEd25519: privateKey.ed25519Public)
-            let shared = try KeyMaterial.sharedSecret(x25519Private: xPriv, ephemeralPublic: v2.ephemeralPublicKey)
-            let key = KeyMaterial.deriveKey(sharedSecret: shared, ephemeralPublicKey: v2.ephemeralPublicKey,
-                                            recipientXPublic: xPub)
-
-            let publisher = SafeOutputPublisher(destinationURL: destinationURL)
-            let fh: FileHandle
-            do { fh = try publisher.start() } catch { throw error }
-            var processed: Int64 = 0
-            let total = max(0, containerSize - Int64(headerSize))
-            do {
-                let crypto = AesGcmChunkCrypto(key: key, header: header, baseNonce: v2.baseNonce, chunkLen: Int(v2.chunkLen))
-                let dec = ChunkedDecryptor(crypto: crypto)
-                let blockSize = dec.blockSize
-                try dec.run(reader: { try? reader.read(upToCount: blockSize) }) { plain in
-                    try Cancellation.checkChunkCancellation()   // D-16: between chunks
-                    processed += Int64(plain.count)
-                    progress?(EngineProgress(bytesProcessed: processed, totalBytes: total))
-                    try fh.write(contentsOf: plain)
+            let magic = try readMagic(containerURL)
+            let url: URL
+            if magic == ContainerCodec.magic {
+                guard case .ed25519(let mat) = privateKey else {
+                    throw EngineError.unsupportedFormat("container key algorithm does not match the selected key")
                 }
-                try publisher.publish(fh: fh)                  // only after full authentication
-                return .success(destinationURL)
-            } catch {
-                publisher.abort()                              // remove temp, publish nothing
-                throw error
+                url = try decryptEd25519(containerURL: containerURL, privateKey: mat,
+                                         destinationURL: destinationURL, progress: progress)
+            } else if magic == ContainerCodec.magicRSA {
+                guard case .rsa(let mat) = privateKey else {
+                    throw EngineError.unsupportedFormat("container key algorithm does not match the selected key")
+                }
+                url = try decryptRSA(containerURL: containerURL, privateKey: mat,
+                                     destinationURL: destinationURL, progress: progress)
+            } else {
+                throw EngineError.unsupportedFormat("not a PKCrypt file (bad header)")
             }
+            return .success(url)
         } catch is CancellationError {
             return .failure(.cancelled)
         } catch let e as EngineError {
@@ -229,7 +209,88 @@ public enum PKCryptEngine {
         }
     }
 
+    private static func decryptEd25519(containerURL: URL, privateKey: PrivateKeyMaterial,
+                                       destinationURL: URL,
+                                       progress: ProgressHandler?) throws -> URL {
+        let reader = try FileHandle(forReadingFrom: containerURL)
+        defer { try? reader.close() }
+        let containerSize = fileSize(of: containerURL)
+
+        let prefix = try reader.read(upToCount: ContainerCodec.prefixBytes) ?? Data()
+        guard prefix.count >= ContainerCodec.prefixBytes else {
+            throw EngineError.unsupportedFormat("encrypted payload too short or corrupt")
+        }
+        let cipher = prefix[ContainerCodec.magicBytes]
+        let nonceLen = try ContainerCodec.nonceLen(forCipher: cipher)
+        let headerSize = ContainerCodec.prefixBytes + ContainerCodec.ephPubBytes + nonceLen + ContainerCodec.chunkLenBytes
+        var header = prefix
+        if header.count < headerSize {
+            let rest = try reader.read(upToCount: headerSize - header.count) ?? Data()
+            header.append(rest)
+        }
+        guard header.count >= headerSize else {
+            throw EngineError.unsupportedFormat("encrypted payload too short or corrupt")
+        }
+        let v2 = try V2Header.parse(header)
+
+        // Key establishment (Ed25519 -> X25519 -> ECDH -> HKDF).
+        let xPriv = KeyMaterial.x25519Private(fromSeed: privateKey.seed, ed25519Public: privateKey.ed25519Public)
+        let xPub = try KeyMaterial.x25519Public(fromEd25519: privateKey.ed25519Public)
+        let shared = try KeyMaterial.sharedSecret(x25519Private: xPriv, ephemeralPublic: v2.ephemeralPublicKey)
+        let key = KeyMaterial.deriveKey(sharedSecret: shared, ephemeralPublicKey: v2.ephemeralPublicKey,
+                                        recipientXPublic: xPub)
+
+        let publisher = SafeOutputPublisher(destinationURL: destinationURL)
+        let fh: FileHandle
+        do { fh = try publisher.start() } catch { throw error }
+        var processed: Int64 = 0
+        let total = max(0, containerSize - Int64(headerSize))
+        do {
+            // Cipher dispatch (cipher 0x01 XChaCha read is exclusive via libsodium).
+            let crypto: any ChunkDecrypting
+            switch v2.cipher {
+            case ContainerCodec.cipherAES:
+                crypto = AesGcmChunkCrypto(key: key, header: header, baseNonce: v2.baseNonce, chunkLen: Int(v2.chunkLen))
+            case ContainerCodec.cipherXChaCha20:
+                crypto = XChaCha20ChunkCrypto(key: key, header: header, baseNonce: v2.baseNonce, chunkLen: Int(v2.chunkLen))
+            default:
+                throw EngineError.unsupportedFormat("unsupported cipher: \(v2.cipher)")
+            }
+            let dec = ChunkedDecryptor(crypto: crypto)
+            let blockSize = dec.blockSize
+            try dec.run(reader: { try? reader.read(upToCount: blockSize) }) { plain in
+                try Cancellation.checkChunkCancellation()   // D-16: between chunks
+                processed += Int64(plain.count)
+                progress?(EngineProgress(bytesProcessed: processed, totalBytes: total))
+                try fh.write(contentsOf: plain)
+            }
+            try publisher.publish(fh: fh)                  // only after full authentication
+            return destinationURL
+        } catch {
+            publisher.abort()                              // remove temp, publish nothing
+            throw error
+        }
+    }
+
+    private static func decryptRSA(containerURL: URL, privateKey: RSAPrivateKeyMaterial,
+                                   destinationURL: URL,
+                                   progress: ProgressHandler?) throws -> URL {
+        // RED stub — implemented in the GREEN commit.
+        _ = (containerURL, privateKey, destinationURL, progress)
+        throw EngineError.authFailure
+    }
+
     // MARK: - Internal helpers
+
+    /// Read the first 8 bytes (the container magic) for v2/v3 decrypt dispatch.
+    /// An unreadable/empty file is a flat format rejection — never a crypto leak.
+    private static func readMagic(_ url: URL) throws -> [UInt8] {
+        let fh = try FileHandle(forReadingFrom: url)
+        defer { try? fh.close() }
+        let prefix = try fh.read(upToCount: ContainerCodec.magicBytes) ?? Data()
+        if prefix.isEmpty { throw EngineError.unsupportedFormat("not a PKCrypt file (bad header)") }
+        return Array(prefix.prefix(ContainerCodec.magicBytes))
+    }
 
     /// Read a file in bounded pieces (chunk_len) so memory use is independent of
     /// file size (D-14). An empty file emits no pieces; the encryptor's `finish()`

@@ -15,6 +15,11 @@ import Foundation
 @Suite("FacadeRoutingTests — RSA + XChaCha read through the union facade")
 struct FacadeRoutingTests {
 
+    private static func isUnsupported(_ e: EngineError) -> Bool {
+        if case .unsupportedFormat = e { return true }
+        return false
+    }
+
     // MARK: - RSA encrypt (Task 1)
 
     @Test("FK: .rsa encrypt yields a v3 PKCRYPT\\x03 container whose wrapped-key length == modulusBytes")
@@ -87,5 +92,119 @@ struct FacadeRoutingTests {
                                              destinationURL: d.file("ok.pkcrypt"))
         #expect(ok == .success(d.file("ok.pkcrypt")))
         #expect(d.tempArtifacts().isEmpty)
+    }
+
+    // MARK: - RSA decrypt + XChaCha read + cross-algorithm rejection (Task 2)
+
+    @Test("FK: .rsa decrypt recovers plaintext from v3 AES-GCM containers at 0/1MiB/1MiB+1, RSA-2048 and RSA-4096")
+    func fkRsaDecryptRecoversPlaintext() async throws {
+        let cases: [(String, Int, RSAPrivateKeyMaterial)] = [
+            ("rsa2048_empty", 0, Fixtures.rsa2048Material),
+            ("rsa2048_1MiB", 1 << 20, Fixtures.rsa2048Material),
+            ("rsa2048_1MiBplus1", (1 << 20) + 1, Fixtures.rsa2048Material),
+            ("rsa4096_empty", 0, Fixtures.rsa4096Material),
+            ("rsa4096_1MiB", 1 << 20, Fixtures.rsa4096Material),
+            ("rsa4096_1MiBplus1", (1 << 20) + 1, Fixtures.rsa4096Material),
+        ]
+        for (name, n, key) in cases {
+            let d = SafeDir(); defer { d.cleanup() }
+            try Fixtures.rsaContainer(name).write(to: d.file("in.pkcrypt"))
+            let result = await PKCryptEngine.decrypt(containerURL: d.file("in.pkcrypt"),
+                                                     privateKey: .rsa(key),
+                                                     destinationURL: d.file("out"))
+            guard case .success = result else {
+                Issue.record("\(name): expected success, got \(result)")
+                continue
+            }
+            #expect(try Data(contentsOf: d.file("out")) == pattern(n),
+                    "rsa \(name) recovered != original (\(n) bytes)")
+            #expect(d.tempArtifacts().isEmpty, "\(name): no .tmp may remain")
+        }
+    }
+
+    @Test("FK: XChaCha20 (cipher 0x01) v2 and v3 containers decrypt through the facade via libsodium ietf_decrypt")
+    func fkXChaChaReadViaFacade() async throws {
+        // v3 RSA XChaCha (read-only; no encrypt path is exposed).
+        let d1 = SafeDir(); defer { d1.cleanup() }
+        try Fixtures.rsaContainer("rsa2048_xc_1MiB").write(to: d1.file("in.pkcrypt"))
+        let r = await PKCryptEngine.decrypt(containerURL: d1.file("in.pkcrypt"),
+                                            privateKey: .rsa(Fixtures.rsa2048Material),
+                                            destinationURL: d1.file("out"))
+        guard case .success = r else { Issue.record("v3 XChaCha decrypt failed: \(r)"); return }
+        #expect(try Data(contentsOf: d1.file("out")) == pattern(1 << 20))
+        #expect(d1.tempArtifacts().isEmpty)
+
+        // v2 Ed25519 XChaCha.
+        let d2 = SafeDir(); defer { d2.cleanup() }
+        try Fixtures.container("xc_ed_1MiB").write(to: d2.file("in.pkcrypt"))
+        let r2 = await PKCryptEngine.decrypt(containerURL: d2.file("in.pkcrypt"),
+                                             privateKey: .ed25519(Fixtures.privateKey),
+                                             destinationURL: d2.file("out"))
+        guard case .success = r2 else { Issue.record("v2 XChaCha decrypt failed: \(r2)"); return }
+        #expect(try Data(contentsOf: d2.file("out")) == pattern(1 << 20))
+        #expect(d2.tempArtifacts().isEmpty)
+    }
+
+    @Test("FK: v2-container/RSA-key and v3-container/Ed25519-key mismatches return typed unsupportedFormat — NOT authFailure")
+    func fkCrossAlgorithmMismatchIsTyped() async throws {
+        // v2 container + RSA private key -> typed unsupportedFormat (PITFALL #10).
+        let d1 = SafeDir(); defer { d1.cleanup() }
+        try Fixtures.container("1MiB").write(to: d1.file("in.pkcrypt"))
+        let r = await PKCryptEngine.decrypt(containerURL: d1.file("in.pkcrypt"),
+                                            privateKey: .rsa(Fixtures.rsa2048Material),
+                                            destinationURL: d1.file("out"))
+        guard case .failure(let err) = r else { Issue.record("expected failure, got \(r)"); return }
+        #expect(Self.isUnsupported(err), "a v2/RSA mismatch is a typed unsupportedFormat, got \(err)")
+        #expect(!FileManager.default.fileExists(atPath: d1.file("out").path))
+
+        // v3 container + Ed25519 private key -> typed unsupportedFormat.
+        let d2 = SafeDir(); defer { d2.cleanup() }
+        try Fixtures.rsaContainer("rsa2048_empty").write(to: d2.file("in.pkcrypt"))
+        let r2 = await PKCryptEngine.decrypt(containerURL: d2.file("in.pkcrypt"),
+                                             privateKey: .ed25519(Fixtures.privateKey),
+                                             destinationURL: d2.file("out"))
+        guard case .failure(let err2) = r2 else { Issue.record("expected failure, got \(r2)"); return }
+        #expect(Self.isUnsupported(err2), "a v3/Ed25519 mismatch is a typed unsupportedFormat, got \(err2)")
+        #expect(!FileManager.default.fileExists(atPath: d2.file("out").path))
+    }
+
+    @Test("FK: wrong RSA key and tampered/truncated v3 return the single generic authFailure with no destination")
+    func fkRsaWrongKeyAndTamperReturnAuthFailure() async throws {
+        // Wrong same-size RSA key -> generic authFailure, no dest, no .tmp.
+        let d1 = SafeDir(); defer { d1.cleanup() }
+        try Fixtures.rsaContainer("rsa2048_1MiB").write(to: d1.file("in.pkcrypt"))
+        let wrong = await PKCryptEngine.decrypt(containerURL: d1.file("in.pkcrypt"),
+                                                privateKey: .rsa(Fixtures.rsaOtherMaterial),
+                                                destinationURL: d1.file("out"))
+        guard case .failure(let werr) = wrong else { Issue.record("expected authFailure, got \(wrong)"); return }
+        #expect(werr == .authFailure, "wrong RSA key must fold into the single generic authFailure (T-02-09)")
+        #expect(!FileManager.default.fileExists(atPath: d1.file("out").path))
+        #expect(d1.tempArtifacts().isEmpty)
+
+        // Tampered v3 (flip a mid-body byte) -> authFailure, no dest.
+        let d2 = SafeDir(); defer { d2.cleanup() }
+        var tampered = try Fixtures.rsaContainer("rsa2048_1MiBplus1")
+        tampered[tampered.count / 2] ^= 0xFF
+        try tampered.write(to: d2.file("in.pkcrypt"))
+        let t = await PKCryptEngine.decrypt(containerURL: d2.file("in.pkcrypt"),
+                                            privateKey: .rsa(Fixtures.rsa2048Material),
+                                            destinationURL: d2.file("out"))
+        guard case .failure(let terr) = t else { Issue.record("expected authFailure, got \(t)"); return }
+        #expect(terr == .authFailure)
+        #expect(!FileManager.default.fileExists(atPath: d2.file("out").path))
+        #expect(d2.tempArtifacts().isEmpty)
+
+        // Truncated v3 (cut the final tag) -> authFailure, no dest.
+        let d3 = SafeDir(); defer { d3.cleanup() }
+        var truncated = try Fixtures.rsaContainer("rsa2048_1MiBplus1")
+        truncated.removeLast(5)
+        try truncated.write(to: d3.file("in.pkcrypt"))
+        let tr = await PKCryptEngine.decrypt(containerURL: d3.file("in.pkcrypt"),
+                                             privateKey: .rsa(Fixtures.rsa2048Material),
+                                             destinationURL: d3.file("out"))
+        guard case .failure(let trerr) = tr else { Issue.record("expected authFailure, got \(tr)"); return }
+        #expect(trerr == .authFailure)
+        #expect(!FileManager.default.fileExists(atPath: d3.file("out").path))
+        #expect(d3.tempArtifacts().isEmpty)
     }
 }
