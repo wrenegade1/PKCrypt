@@ -275,9 +275,68 @@ public enum PKCryptEngine {
     private static func decryptRSA(containerURL: URL, privateKey: RSAPrivateKeyMaterial,
                                    destinationURL: URL,
                                    progress: ProgressHandler?) throws -> URL {
-        // RED stub — implemented in the GREEN commit.
-        _ = (containerURL, privateKey, destinationURL, progress)
-        throw EngineError.authFailure
+        let reader = try FileHandle(forReadingFrom: containerURL)
+        defer { try? reader.close() }
+        let containerSize = fileSize(of: containerURL)
+
+        // Derive the wrapped-key length from the parsed private key FIRST (Pitfall 2
+        // / T-03-08): RSA-2048 -> 256, RSA-4096 -> 512. Never a hardcoded 256.
+        let modulusBytes = privateKey.modulusBytes
+
+        let prefix = try reader.read(upToCount: ContainerCodec.prefixBytes) ?? Data()
+        guard prefix.count >= ContainerCodec.prefixBytes else {
+            throw EngineError.unsupportedFormat("encrypted payload too short or corrupt")
+        }
+        let cipher = prefix[ContainerCodec.magicBytes]
+        let nonceLen = try ContainerCodec.nonceLen(forCipher: cipher)
+        let headerSize = RSAHeader.headerSize(nonceLen: nonceLen, modulusBytes: modulusBytes)
+        var header = prefix
+        if header.count < headerSize {
+            let rest = try reader.read(upToCount: headerSize - header.count) ?? Data()
+            header.append(rest)
+        }
+        guard header.count >= headerSize else {
+            throw EngineError.unsupportedFormat("encrypted payload too short or corrupt")
+        }
+        let rsaHeader = try RSAHeader.parse(header, modulusBytes: modulusBytes)
+
+        // Unwrap the session key. ANY OAEP failure (wrong key, garbage wrapped
+        // key) folds into the single generic authFailure (T-02-09 / T-03-06).
+        let session = try KeyMaterial.rsaUnwrap(wrapped: rsaHeader.wrappedKey, privateKey: privateKey)
+
+        let publisher = SafeOutputPublisher(destinationURL: destinationURL)
+        let fh: FileHandle
+        do { fh = try publisher.start() } catch { throw error }
+        var processed: Int64 = 0
+        let total = max(0, containerSize - Int64(headerSize))
+        do {
+            // Cipher dispatch: cipher 0x00 -> AES-GCM; cipher 0x01 -> XChaCha20
+            // read (libsodium ietf_decrypt only — Pitfall 1/3, T-03-07).
+            let crypto: any ChunkDecrypting
+            switch rsaHeader.cipher {
+            case ContainerCodec.cipherAES:
+                crypto = AesGcmChunkCrypto(key: session, header: header,
+                                           baseNonce: rsaHeader.baseNonce, chunkLen: Int(rsaHeader.chunkLen))
+            case ContainerCodec.cipherXChaCha20:
+                crypto = XChaCha20ChunkCrypto(key: session, header: header,
+                                              baseNonce: rsaHeader.baseNonce, chunkLen: Int(rsaHeader.chunkLen))
+            default:
+                throw EngineError.unsupportedFormat("unsupported cipher: \(rsaHeader.cipher)")
+            }
+            let dec = ChunkedDecryptor(crypto: crypto)
+            let blockSize = dec.blockSize
+            try dec.run(reader: { try? reader.read(upToCount: blockSize) }) { plain in
+                try Cancellation.checkChunkCancellation()   // D-16: between chunks
+                processed += Int64(plain.count)
+                progress?(EngineProgress(bytesProcessed: processed, totalBytes: total))
+                try fh.write(contentsOf: plain)
+            }
+            try publisher.publish(fh: fh)                  // only after full authentication
+            return destinationURL
+        } catch {
+            publisher.abort()                              // remove temp, publish nothing
+            throw error
+        }
     }
 
     // MARK: - Internal helpers
