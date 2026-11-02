@@ -77,6 +77,21 @@ final class WorkflowViewModel: ObservableObject {
         resetFeedback()
     }
 
+    func selectKeyFailure() {
+        privateKey = nil
+        keySummary = nil
+        resetFeedback()
+    }
+
+    /// Surfaces a picker/validation-level engine error (e.g. the D-13
+    /// passphrase guard) through the same D-20 seam as run-time failures.
+    func reportPickerError(_ error: EngineError) {
+        resetFeedback()
+        let msg = UserMessage.message(for: error)
+        errorTitle = msg.title
+        errorDetail = msg.detail
+    }
+
     func selectPrivateKey(_ key: PrivateKeyMaterial, summary: String?) {
         privateKey = key
         keySummary = summary

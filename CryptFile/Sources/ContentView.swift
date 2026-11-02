@@ -15,7 +15,7 @@ struct ContentView: View {
             EncryptView(viewModel: workflow)
                 .tabItem { Label("Encrypt", systemImage: "lock.fill") }
                 .tag(0)
-            DecryptView()
+            DecryptView(viewModel: workflow)
                 .tabItem { Label("Decrypt", systemImage: "lock.open.fill") }
                 .tag(1)
         }
