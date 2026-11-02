@@ -63,13 +63,34 @@ public final class SafeOutputPublisher {
     }
 }
 
-// MARK: - Progress (D-15 surface; wiring finalized in Plan 03)
+// MARK: - Output filename derivation (D-09, WITHOUT D-10 auto-numbering)
 
-public struct EngineProgress: Sendable {
-    public let bytesProcessed: Int64
-    public let totalBytes: Int64?
-    public init(bytesProcessed: Int64, totalBytes: Int64?) {
-        self.bytesProcessed = bytesProcessed
-        self.totalBytes = totalBytes
+extension SafeOutputPublisher {
+    /// D-09: the default encrypted output path is `<input>.pkcrypt`.
+    /// Mirrors `files.py` `encrypted_output_path` (strip any trailing `/`,
+    /// then append `.pkcrypt`). No collision handling here: if that name is
+    /// taken at publication time, `renamex_np(RENAME_EXCL)` returns EEXIST and
+    /// the caller receives `EngineError.destinationExists` (D-10) — never a
+    /// silent `.1`/`.2` fallback.
+    public static func encryptedOutputPath(for input: URL) -> URL {
+        let path = input.path.hasSuffix("/") ? String(input.path.dropLast()) : input.path
+        return URL(fileURLWithPath: path + ".pkcrypt")
+    }
+
+    /// D-09: the default decrypted output path strips a trailing `.pkcrypt`
+    /// else appends `.decrypted` — the CLI's *candidate-name* rule. Critically,
+    /// it does NOT reproduce `files.py` `unused_path()`'s numeric-suffix retry
+    /// (D-10): the plain stem is returned even if it already exists, and a real
+    /// collision surfaces as `EngineError.destinationExists` from the publisher
+    /// so the app can prompt the user for a new name.
+    public static func decryptedOutputPath(for input: URL) -> URL {
+        let path = input.path
+        if (path as NSString).lastPathComponent.hasSuffix(".pkcrypt") {
+            let stripped = String(path.dropLast(".pkcrypt".count))
+            if !(stripped as NSString).lastPathComponent.isEmpty {
+                return URL(fileURLWithPath: stripped)
+            }
+        }
+        return URL(fileURLWithPath: path + ".decrypted")
     }
 }
