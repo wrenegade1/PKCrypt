@@ -31,6 +31,7 @@ final class WorkflowViewModel: ObservableObject {
 
     // Run / feedback state
     @Published var isRunning = false
+    @Published private(set) var isCustomDestination = false   // D-15 override vs D-14 live default
     @Published private(set) var fraction: Double = 0
     @Published private(set) var progressText: String?
     @Published private(set) var outputPath: String?   // success path (D-19)
@@ -66,6 +67,18 @@ final class WorkflowViewModel: ObservableObject {
 
     func setDestination(_ url: URL) {
         destination = url
+        // D-14: this is the live default (CLI-derived); any Change… override clears
+        // this flag via setCustomDestination(D-15).
+        isCustomDestination = false
+        persistGranted(url, scope: .destination)
+        resetFeedback()
+    }
+
+    /// D-15: a user 'Change…' NSSavePanel override — full folder+filename control.
+    /// Persisted as a security-scoped bookmark and kept as the active destination.
+    func setCustomDestination(_ url: URL) {
+        destination = url
+        isCustomDestination = true
         persistGranted(url, scope: .destination)
         resetFeedback()
     }
@@ -142,7 +155,9 @@ final class WorkflowViewModel: ObservableObject {
     /// selections are kept in context (D-02).
     func run(toAlt destination: URL) {
         guard pendingAlternateDestination, !isRunning else { return }
-        self.destination = destination
+        // D-16 alternate is a user-chosen destination → persist as a bookmark
+        // (setCustomDestination) so it stays accessible on relaunch (APP-03).
+        setCustomDestination(destination)
         pendingAlternateDestination = false
         run()
     }

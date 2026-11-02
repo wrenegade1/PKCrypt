@@ -144,8 +144,9 @@ struct EncryptView: View {
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         viewModel.setInput(url)
-        if viewModel.destination == nil {
-            // D-14: default the destination to <input>.pkcrypt immediately.
+        if viewModel.destination == nil || !viewModel.isCustomDestination {
+            // D-14: the default destination follows the input live (CLI-derived) unless
+            // the user has overridden it with a Change… NSSavePanel (D-15).
             viewModel.setDestination(OutputPath.destination(encrypting: url))
         }
     }
@@ -183,12 +184,18 @@ struct EncryptView: View {
     }
 
     private func redirectDestination(defaultsTo defaultURL: URL) {
+        // D-15: full output-path control — BOTH folder and filename — pre-filled with
+        // the current default name. Full folder control is granted via canCreateDirectories;
+        // on accept the chosen URL is persisted as a security-scoped bookmark and becomes
+        // the active (custom) destination.
         let panel = NSSavePanel()
         panel.title = "Choose where to save the encrypted file"
+        panel.canCreateDirectories = true
+        panel.allowsOtherFileTypes = true
         panel.directoryURL = defaultURL.deletingLastPathComponent()
         panel.nameFieldStringValue = defaultURL.lastPathComponent
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        viewModel.setDestination(url)
+        viewModel.setCustomDestination(url)
     }
 
     /// D-16: after a destination collision, let the user pick a fresh alternate
@@ -196,6 +203,8 @@ struct EncryptView: View {
     private func chooseAlternateDestination() {
         let panel = NSSavePanel()
         panel.title = "Choose an alternate destination"
+        panel.canCreateDirectories = true
+        panel.allowsOtherFileTypes = true
         panel.directoryURL = viewModel.destination?.deletingLastPathComponent()
         panel.nameFieldStringValue = viewModel.destination?.lastPathComponent ?? "output"
         guard panel.runModal() == .OK, let url = panel.url else { return }

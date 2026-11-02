@@ -84,4 +84,35 @@ final class OutputPathTests: XCTestCase {
         let resolved = SecurityScopedAccess.resolveBookmark(for: key)
         XCTAssertEqual(resolved?.path, url.path, "the granted URL must be persistable + resolvable")
     }
+
+    // MARK: - D-14 live default / D-15 custom re-target contract
+
+    /// A Change… override (D-15) sets a custom destination and persists it as a
+    /// bookmark; a CLI-derived live default (D-14) clears the custom flag.
+    @MainActor
+    func testCustomDestinationOverrideIsFlaggedAndPersisted() {
+        let vm = WorkflowViewModel()
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("rt-\(UUID().uuidString)")
+        try! FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let input = tempDir.appendingPathComponent("a.bin")
+        try! Data("x".utf8).write(to: input)
+
+        let key = SecurityScopedAccess.bookmarkKey(for: .destination)
+        UserDefaults.standard.removeObject(forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+
+        // Live default (D-14): CLI-derived, not custom.
+        let defaultDest = tempDir.appendingPathComponent("a.bin.pkcrypt")
+        vm.setDestination(defaultDest)
+        XCTAssertFalse(vm.isCustomDestination, "a CLI-derived default is not a user override")
+
+        // Change… override (D-15): custom flag set + persisted as a bookmark.
+        let custom = tempDir.appendingPathComponent("custom.bin.pkcrypt")
+        try! Data("".utf8).write(to: custom)
+        vm.setCustomDestination(custom)
+        XCTAssertTrue(vm.isCustomDestination, "an NSSavePanel override must mark the destination custom")
+        XCTAssertEqual(SecurityScopedAccess.resolveBookmark(for: key)?.path, custom.path,
+                       "the custom destination must be persisted as a security-scoped bookmark")
+    }
 }
