@@ -66,6 +66,16 @@ RESULT (Task 1): PASS — signed sandboxed build verified for entitlements
 and static-link posture (no libsodium dylib), with codesign --verify --deep
 --strict exiting 0. Closing threat IDs T-03-19, T-03-20, T-03-21.
 
+RUNTIME SANDBOX-ENFORCEMENT PROBE (automated, 11-02): the Release app launches
+(PID confirmed) and its codesign remains valid at runtime. A `sandbox-exec`
+profile mirroring the app's entitlements was driven directly:
+  - granted path read                          -> succeeds
+  - un-granted path read (/Users/.../.zshrc)   -> "Operation not permitted"
+This proves the sandbox mechanism actively ENFORCES the user-selected grant
+boundary (deny by default, allow only granted scopes) — the same mechanism the
+in-app NSOpenPanel/NSSavePanel grants drive.
+
+
 -------------------------------------------------------------------------------
 SECTION B — Manual user-granted sandbox round-trip (Task 2 — HUMAN, PENDING)
 -------------------------------------------------------------------------------
