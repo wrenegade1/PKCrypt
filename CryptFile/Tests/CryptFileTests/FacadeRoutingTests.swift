@@ -5,16 +5,26 @@ import XCTest
 import PKCryptEngine
 
 /// Fixture locator for the committed PKCryptEngine key fixtures, resolved from
-/// the test source file's checked-in path (the engine fixtures are read from the
-/// source tree, mirroring PKCryptEngine's own `Fixtures` pattern).
+/// the test source file's checked-in path. Keys and containers are generated
+/// for each run by PKCryptEngine/Scripts/make_test_fixtures.py (the same
+/// generator the engine tests use), via the scheme's test pre-action; no key
+/// material is committed.
 enum TestFixtures {
     static let repoRoot = URL(fileURLWithPath: #filePath)   // .../CryptFile/Tests/CryptFileTests/FacadeRoutingTests.swift
         .deletingLastPathComponent()                          // CryptFile/Tests/CryptFileTests
         .deletingLastPathComponent()                          // CryptFile/Tests
         .deletingLastPathComponent()                          // CryptFile
         .deletingLastPathComponent()                          // repo root
-    static let fixtureDir = repoRoot
-        .appendingPathComponent("PKCryptEngine/Tests/PKCryptEngineTests/Fixtures")
+    /// Generated before the run by the CryptFile scheme's test pre-action
+    /// (the sandboxed test host cannot launch python3/ssh-keygen itself).
+    static let fixtureDir: URL = {
+        let dir = repoRoot.appendingPathComponent(".test-fixtures/cryptfile")
+        guard FileManager.default.fileExists(atPath: dir.appendingPathComponent("ed25519_fixture").path) else {
+            fatalError("test fixtures missing at \(dir.path): run the tests through the CryptFile "
+                       + "scheme, whose test pre-action generates them (see .test-fixtures/cryptfile.log)")
+        }
+        return dir
+    }()
     static let publicKeyFile = fixtureDir.appendingPathComponent("ed25519_fixture.pub")
     static let privateKeyFile = fixtureDir.appendingPathComponent("ed25519_fixture")
     static let publicKeyData: Data = try! Data(contentsOf: publicKeyFile)
@@ -96,7 +106,7 @@ final class FacadeRoutingTests: XCTestCase {
 
     /// KeySelection.detectAndParsePublic delegates to the engine and returns the
     /// parsed Ed25519 PublicKeyMaterial (union .ed25519); comment(of:) extracts
-    /// the D-08 identity comment (the third+ whitespace token: `pkcrypt-engine-fixture@local`).
+    /// the D-08 identity comment (the third+ whitespace token: `ed25519_fixture@pkcrypt-test`).
     func testKeySelectionParsesEd25519PublicAndComment() throws {
         let key = try KeySelection.detectAndParsePublic(TestFixtures.publicKeyData)
         guard case .ed25519(let mat) = key else {
@@ -104,7 +114,7 @@ final class FacadeRoutingTests: XCTestCase {
         }
         XCTAssertEqual(mat.ed25519Public.count, 32)
         XCTAssertEqual(KeySelection.comment(of: TestFixtures.publicKeyData),
-                       "pkcrypt-engine-fixture@local")
+                       "ed25519_fixture@pkcrypt-test")
     }
 
     // MARK: - Union-facade app contract (RSA + XChaCha + cross-key; Task 2)

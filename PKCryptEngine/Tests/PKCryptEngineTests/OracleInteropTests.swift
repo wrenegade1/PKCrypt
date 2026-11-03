@@ -29,9 +29,7 @@ struct OracleInteropTests {
         return FileManager.default.fileExists(atPath: core.path) ? root : nil
     }()
 
-    static let keysDir = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent()
-        .appendingPathComponent("Fixtures")
+    static let keysDir = GeneratedFixtures.dir
     static let privKey = keysDir.appendingPathComponent("ed25519_fixture")
     static let pubKey = keysDir.appendingPathComponent("ed25519_fixture.pub")
 

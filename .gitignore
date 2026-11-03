@@ -21,3 +21,6 @@ src/*.o
 
 # Editor tooling (clangd index)
 .cache/
+
+# Generated throwaway test keys/containers (CryptFile scheme pre-action)
+.test-fixtures/

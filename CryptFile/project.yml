@@ -44,9 +44,6 @@ targets:
         com.apple.security.app-sandbox: true
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.files.bookmarks.app-scope: true
-    scheme:
-      testTargets:
-        - CryptFileTests
   CryptFileTests:
     type: bundle.unit-test
     platform: macOS
@@ -59,3 +56,36 @@ targets:
       base:
         SWIFT_VERSION: "5.9"
         GENERATE_INFOPLIST_FILE: YES
+schemes:
+  CryptFile:
+    build:
+      targets:
+        CryptFile: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - CryptFileTests
+      # The tests run inside the sandboxed app, where python3/ssh-keygen cannot
+      # be launched. Generate the throwaway test keys and containers here,
+      # outside the sandbox, before the tests start; no key material is
+      # committed. The tests read ../.test-fixtures/cryptfile (git-ignored).
+      preActions:
+        - name: Generate test fixtures
+          settingsTarget: CryptFileTests
+          script: |
+            set -e
+            [ -n "${SRCROOT}" ] || exit 1
+            FX_ROOT="${SRCROOT}/../.test-fixtures"
+            mkdir -p "${FX_ROOT}"
+            rm -rf "${FX_ROOT}/cryptfile"
+            PYTHONPATH="${SRCROOT}/.." /usr/bin/python3 \
+              "${SRCROOT}/../PKCryptEngine/Scripts/make_test_fixtures.py" \
+              "${FX_ROOT}/cryptfile" > "${FX_ROOT}/cryptfile.log" 2>&1
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

@@ -30,8 +30,8 @@ let package = Package(
         .testTarget(
             name: "PKCryptEngineTests",
             dependencies: ["PKCryptEngine"],
-            // Fixtures are read from the source tree via #filePath, not bundled.
-            exclude: ["Fixtures"],
+            // Test keys and containers are generated per run
+            // (Scripts/make_test_fixtures.py); none are committed.
             linkerSettings: [
                 .unsafeFlags(["/opt/homebrew/lib/libsodium.a"])
             ]

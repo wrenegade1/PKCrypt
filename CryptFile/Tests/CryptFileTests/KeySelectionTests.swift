@@ -42,7 +42,9 @@ final class KeySelectionTests: XCTestCase {
     }
 
     func testDetectAndParsePublicUnknownTypeThrowsKeyError() {
-        let unknown = Data("ssh-dsa REMOVED-TEST-KEY".utf8)
+        // A synthetic key line of an unsupported type (built here; not a real key).
+        let blob = Data([0, 0, 0, 7]) + Data("ssh-dsa".utf8) + Data(repeating: 0x41, count: 24)
+        let unknown = Data("ssh-dsa \(blob.base64EncodedString())".utf8)
         let error = extractError { _ = try KeySelection.detectAndParsePublic(unknown) }
         guard case .keyError(let detail)? = error else {
             return XCTFail("expected .keyError for an unknown key type, got \(String(describing: error))")
@@ -89,10 +91,13 @@ final class KeySelectionTests: XCTestCase {
 
     func testCommentExtraction() {
         XCTAssertEqual(KeySelection.comment(of: TestFixtures.publicKeyData),
-                       "pkcrypt-engine-fixture@local")
+                       "ed25519_fixture@pkcrypt-test")
         XCTAssertEqual(KeySelection.comment(of: TestFixtures.rsaPublicData),
                        "rsa2048@pkcrypt-test")
-        XCTAssertNil(KeySelection.comment(of: Data("ssh-ed25519 REMOVED-TEST-KEY".utf8)),
+        // The generated key's line with its comment removed ("type base64").
+        let bare = String(decoding: TestFixtures.publicKeyData, as: UTF8.self)
+            .split(separator: " ").prefix(2).joined(separator: " ")
+        XCTAssertNil(KeySelection.comment(of: Data(bare.utf8)),
                      "a key line with no comment returns nil")
     }
 

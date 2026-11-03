@@ -30,11 +30,10 @@ func pattern(_ n: Int) -> Data {
     Data((0 ..< n).map { UInt8(($0 * 7 + 3) & 0xFF) })
 }
 
-/// Suite-level test resources: the committed keypair + fixture directory.
+/// Suite-level test resources: throwaway keys + oracle containers generated
+/// for this run (nothing is committed; see GeneratedFixtures).
 struct Fixtures {
-    static let dir = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent()
-        .appendingPathComponent("Fixtures")
+    static let dir = GeneratedFixtures.dir
     static let privateKeyURL = dir.appendingPathComponent("ed25519_fixture")
     static let publicKeyURL = dir.appendingPathComponent("ed25519_fixture.pub")
     static let containersDir = dir.appendingPathComponent("Containers")
@@ -234,7 +233,7 @@ struct FormatVectorTests {
 
     // MARK: HKDF / ECDH / Ed->X key derivation matches the oracle
 
-    @Test("derived key matches the Python oracle for the committed short-container header")
+    @Test("derived key matches the Python oracle for the short-container header")
     func hkdfKeyVector() throws {
         let shortHeader = FitHeader.fromContainer(Fixtures.container("short"), headerSize: 58)
         let v2 = try V2Header.parse(shortHeader)
@@ -244,7 +243,10 @@ struct FormatVectorTests {
         let shared = try KeyMaterial.sharedSecret(x25519Private: xPriv, ephemeralPublic: v2.ephemeralPublicKey)
         let key = KeyMaterial.deriveKey(sharedSecret: shared, ephemeralPublicKey: v2.ephemeralPublicKey,
                                         recipientXPublic: xPub)
-        let expected = "REMOVED-TEST-KEY"
+        // Derived independently by the Python reference when it made the container.
+        let expected = try String(contentsOf: Fixtures.dir.appendingPathComponent("short_derived_key.hex"),
+                                  encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(expected.count == 64)
         #expect(key.hexString == expected)
     }
 
@@ -375,7 +377,7 @@ struct FormatVectorTests {
 
     @Test("an RSA key with modulus < 2048 bits returns keyError before any crypto")
     func rsaShortKeyRejected() throws {
-        // Committed RSA-1024 public key (ssh-keygen -b 1024).
+        // Generated RSA-1024 public key (ssh-keygen -b 1024): must be refused.
         let smallPub = Fixtures.rsaDir.appendingPathComponent("small_rsa.pub")
         do {
             _ = try KeyMaterial.parseRSAPublic(Data(contentsOf: smallPub))
@@ -494,17 +496,24 @@ enum FitHeader {
 
 @Suite("libsodium FFI + static link")
 struct LibsodiumLinkSmokeTests {
-    @Test("sodium_init returns 0/1 and pk_to_curve matches the oracle x_pub")
+    @Test("sodium_init returns 0/1 and pk_to_curve agrees with the secret-key path")
     func libsodiumLinkSmoke() throws {
         let initRC = sodium_init()
         #expect(initRC == 0 || initRC == 1)
-        let edPub = try #require(Data(hex: "REMOVED-TEST-KEY"))
-        var out = [UInt8](repeating: 0, count: 32)
+        // A throwaway Ed25519 key (CryptoKit). libsodium's conversion of the
+        // public half must equal the X25519 public key CryptoKit derives from
+        // the engine's conversion of the secret half: two independent paths.
+        let ed = Curve25519.Signing.PrivateKey()
+        let edPub = ed.publicKey.rawRepresentation
+        var fromPub = [UInt8](repeating: 0, count: 32)
         let rc = edPub.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Int32 in
-            crypto_sign_ed25519_pk_to_curve25519(&out, buf.bindMemory(to: UInt8.self).baseAddress!)
+            crypto_sign_ed25519_pk_to_curve25519(&fromPub, buf.bindMemory(to: UInt8.self).baseAddress!)
         }
         #expect(rc == 0)
-        #expect(out.count == 32)
-        #expect(Data(out).hexString == "REMOVED-TEST-KEY")
+        let xPriv = KeyMaterial.x25519Private(fromSeed: ed.rawRepresentation, ed25519Public: edPub)
+        let fromSecret = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: xPriv)
+            .publicKey.rawRepresentation
+        #expect(Data(fromPub) == fromSecret)
+        #expect(Data(fromPub) != Data(count: 32))
     }
 }
