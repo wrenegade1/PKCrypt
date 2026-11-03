@@ -53,14 +53,40 @@ enum KeySelection {
         throw EngineError.keyError(details.first ?? "could not parse private key: unsupported type or format")
     }
 
-    /// The key's comment (the third+ whitespace token of the OpenSSH line), for
-    /// the D-08/D-11 recipient/private-key identity summary.
+    /// The comment of a single-line OpenSSH *public* key (`ssh-* <b64> comment`),
+    /// for the D-08 recipient identity summary. Returns nil for anything else -
+    /// in particular a PEM private key, whose text must never be displayed.
     static func comment(of data: Data) -> String? {
         let text = String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.contains("\n"), !text.contains("\r"), !text.contains("-----") else { return nil }
         let parts = text.split(separator: " ").map(String.init)
-        guard parts.count >= 3 else { return nil }
+        guard parts.count >= 3, parts[0].hasPrefix("ssh-"),
+              Data(base64Encoded: parts[1]) != nil else { return nil }
         return parts.dropFirst(2).joined(separator: " ")
+    }
+
+    /// `SHA256:<16 hex>` of the *public* half of a parsed private key, as the
+    /// OpenSSH public-key blob - so it matches `fingerprint(of:)` of the
+    /// corresponding `.pub` file. Nothing derived from the private bytes.
+    static func publicFingerprint(of key: CryptPrivateKey) -> String {
+        var blob = Data()
+        func put(_ d: Data) {
+            var len = UInt32(d.count).bigEndian
+            blob.append(Data(bytes: &len, count: 4)); blob.append(d)
+        }
+        func mpint(_ d: Data) -> Data {                 // OpenSSH mpint: sign byte if high bit set
+            let m = Data(d.drop(while: { $0 == 0 }))
+            return (m.first ?? 0) & 0x80 != 0 ? Data([0]) + m : m
+        }
+        switch key {
+        case .ed25519(let k):
+            put(Data("ssh-ed25519".utf8)); put(k.ed25519Public)
+        case .rsa(let k):
+            put(Data("ssh-rsa".utf8)); put(mpint(k.e)); put(mpint(k.n))
+        }
+        let digest = SHA256.hash(data: blob).prefix(8).map { String(format: "%02x", Int($0)) }.joined()
+        return "SHA256:\(digest)"
     }
 
     /// An 8-byte truncated SHA-256 hex digest of a key's decoded blob, formatted

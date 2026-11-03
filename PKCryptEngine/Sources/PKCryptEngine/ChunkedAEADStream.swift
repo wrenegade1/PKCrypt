@@ -124,6 +124,12 @@ public final class XChaCha20ChunkCrypto: ChunkDecrypting {
     /// `authFailure` (D-11). Returns libsodium's own decrypted bytes.
     public static func xchacha20Decrypt(ciphertextAndTag: Data, aad: Data,
                                         nonce: Data, key: Data) throws -> Data {
+        // libsodium reads exactly 32 key bytes and 24 nonce bytes from the raw
+        // pointers below; anything else would be an out-of-bounds read.
+        guard key.count == 32, nonce.count == ContainerCodec.nonceXC,
+              ciphertextAndTag.count >= ContainerCodec.tagBytes else {
+            throw EngineError.authFailure
+        }
         var out = [UInt8](repeating: 0, count: max(1, ciphertextAndTag.count - ContainerCodec.tagBytes))
         var mlen: UInt64 = 0
         let rc = ciphertextAndTag.withUnsafeBytes { (cb: UnsafeRawBufferPointer) -> Int32 in

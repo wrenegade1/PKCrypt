@@ -101,6 +101,29 @@ final class KeySelectionTests: XCTestCase {
                      "a key line with no comment returns nil")
     }
 
+    /// Security fix: a private key file's text must never become the
+    /// "comment" shown in the UI (the old split-on-spaces returned the PEM's
+    /// base64 body for an unencrypted OpenSSH private key).
+    func testCommentNeverReadsPrivateKeyText() {
+        XCTAssertNil(KeySelection.comment(of: TestFixtures.privateKeyData))
+        XCTAssertNil(KeySelection.comment(of: TestFixtures.rsaPrivateData))
+        let pem = String(decoding: TestFixtures.privateKeyData, as: UTF8.self)
+        XCTAssertNil(KeySelection.comment(of: Data(pem.replacingOccurrences(of: "\n", with: " ").utf8)),
+                     "even flattened onto one line, PEM text is not a public key line")
+    }
+
+    /// The Decrypt identity fingerprint comes from the private key's PUBLIC
+    /// half and matches the corresponding .pub file's fingerprint.
+    func testPrivateKeyFingerprintMatchesItsPublicKey() throws {
+        let ed = try KeySelection.detectAndParsePrivate(TestFixtures.privateKeyData)
+        XCTAssertEqual(KeySelection.publicFingerprint(of: ed),
+                       KeySelection.fingerprint(of: TestFixtures.publicKeyData))
+        let rsa = try KeySelection.detectAndParsePrivate(TestFixtures.rsaPrivateData)
+        XCTAssertEqual(KeySelection.publicFingerprint(of: rsa),
+                       KeySelection.fingerprint(of: TestFixtures.rsaPublicData))
+        XCTAssertNotEqual(KeySelection.publicFingerprint(of: ed), KeySelection.publicFingerprint(of: rsa))
+    }
+
     func testFingerprintEightByteSHA256HexNoRawBlob() {
         let fp = KeySelection.fingerprint(of: TestFixtures.publicKeyData)
         XCTAssertTrue(fp.hasPrefix("SHA256:"), "fingerprint carries the SHA256: prefix")

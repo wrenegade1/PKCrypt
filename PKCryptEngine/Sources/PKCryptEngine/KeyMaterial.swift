@@ -228,6 +228,19 @@ public enum KeyMaterial {
         return b
     }
 
+    /// True if (n, e) are well-formed RSA public numbers: n odd, e odd and
+    /// 3 <= e < n (big-endian magnitudes). The same checks the Python
+    /// (`cryptography`) and C++ implementations apply; e = 1, for example,
+    /// would make RSA-OAEP the identity and expose the session key.
+    static func rsaPublicNumbersOK(n nIn: [UInt8], e eIn: [UInt8]) -> Bool {
+        let n = Array(nIn.drop(while: { $0 == 0 })), e = Array(eIn.drop(while: { $0 == 0 }))
+        guard let nLast = n.last, let eLast = e.last else { return false }
+        guard nLast & 1 == 1, eLast & 1 == 1 else { return false }        // both odd
+        if e.count == 1 && e[0] < 3 { return false }                     // e >= 3
+        if e.count != n.count { return e.count < n.count }               // e < n
+        return e.lexicographicallyPrecedes(n)
+    }
+
     /// Parse an OpenSSH RSA *public* key file: `ssh-rsa <b64> [comment]`.
     public static func parseRSAPublic(_ fileData: Data) throws -> RSAPublicKeyMaterial {
         let s = String(decoding: fileData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -244,6 +257,9 @@ public enum KeyMaterial {
             let keySize = rsaBitLength(n)
             guard keySize >= 2048 else {
                 throw EngineError.keyError("RSA public key is only \(keySize) bits; PKCrypt requires at least 2048 bits")
+            }
+            guard rsaPublicNumbersOK(n: n, e: e) else {
+                throw EngineError.keyError("invalid RSA public key (bad exponent or modulus)")
             }
             return RSAPublicKeyMaterial(modulusBytes: n.count, n: Data(n), e: Data(e))
         } catch let e as EngineError {
@@ -307,6 +323,9 @@ public enum KeyMaterial {
             guard keySize >= 2048 else {
                 throw EngineError.keyError("RSA private key is only \(keySize) bits; PKCrypt requires at least 2048 bits")
             }
+            guard rsaPublicNumbersOK(n: n, e: e) else {
+                throw EngineError.keyError("invalid RSA private key (bad exponent or modulus)")
+            }
             return RSAPrivateKeyMaterial(modulusBytes: n.count,
                                          n: Data(n), e: Data(e), d: Data(d),
                                          p: Data(pPrime), q: Data(qPrime), iqmp: Data(iqmp))
@@ -344,6 +363,9 @@ public enum KeyMaterial {
                                                       wrapped as CFData, &err) as Data? else {
             throw EngineError.authFailure
         }
+        // PKCrypt always wraps exactly a 32-byte session key; anything else is
+        // a malformed or hostile container, reported like any other failure.
+        guard session.count == 32 else { throw EngineError.authFailure }
         return session
     }
 

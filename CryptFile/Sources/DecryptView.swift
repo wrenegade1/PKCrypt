@@ -159,8 +159,9 @@ struct DecryptView: View {
         guard let data = try? Data(contentsOf: url) else { return }
         do {
             let priv = try KeySelection.detectAndParsePrivate(data)
-            let comment = KeySelection.comment(of: data)
-            let fp = KeySelection.fingerprint(of: data)
+            // Identity from the PUBLIC half only: the private file's text and
+            // bytes are never shown or hashed for display (T-03-11).
+            let fp = KeySelection.publicFingerprint(of: priv)
             let typeName: String
             switch priv {
             case .ed25519: typeName = "Ed25519"
@@ -169,7 +170,6 @@ struct DecryptView: View {
             // D-11 private-key identity summary: type + comment + truncated
             // fingerprint — never the raw private key bytes (T-03-11).
             var parts = ["\(typeName) private key"]
-            if let comment { parts.append("· \(comment)") }
             parts.append("· \(fp)")
             viewModel.selectPrivateKey(priv, summary: parts.joined(separator: " "))
         } catch let e as EngineError {

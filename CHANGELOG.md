@@ -7,9 +7,9 @@ All notable changes to PKCrypt are documented here. This project follows
 
 ### Changed
 
-- **Licensed under the Apache License 2.0.** Includes an explicit
-  patent grant and patent-retaliation clause, requires modified files to be
-  marked, and keeps the project names out of the grant. A `NOTICE` file and an
+- **Licensed under the Apache License 2.0.** Includes an explicit patent
+  grant and patent-retaliation clause, requires modified files to be marked,
+  and keeps the project names out of the grant. A `NOTICE` file and an
   `SPDX-License-Identifier: Apache-2.0` header in every source file were added.
 
 ### Added
@@ -36,6 +36,17 @@ All notable changes to PKCrypt are documented here. This project follows
 
 ### Fixed
 
+- **CryptFile no longer shows private key text.** Choosing a private key in
+  Decrypt built the identity summary from the key file's text, which for an
+  unencrypted OpenSSH key displayed part of its base64 body. Comments are now
+  read only from single-line public keys, and the private-key summary shows
+  the fingerprint of its public half (matching the `.pub` file).
+- **Swift engine hardening:** malformed RSA public numbers are refused
+  (n odd, e odd, 3 ≤ e < n), an RSA-unwrapped session key must be exactly
+  32 bytes, and XChaCha20 decryption checks key and nonce lengths before
+  passing buffers to libsodium.
+- **No keys in the repository.** The Swift tests generate their throwaway
+  keys and test containers at run time instead of using committed fixtures.
 - **`bcrypt` is now a declared dependency.** `cryptography` needs it to open
   passphrase-protected OpenSSH keys, so a clean `pip install` could not run
   `decrypt --passphrase` ("Need bcrypt module", exit 2). This was the CI failure.
@@ -177,7 +188,6 @@ All notable changes to PKCrypt are documented here. This project follows
   our own in-house base64 implementation (no bundled third-party code remains).
 - Added author attribution (Warren Zajac) to file headers, comments, and pyproject
   metadata across the codebase.
-- Added the `LICENSE` file (Apache License 2.0).
 - **Pure-Python private-key conversion** — the Ed25519 seed → X25519 private key
   (SHA-512 + bit-clamping) no longer requires libsodium; the public-key
   conversion still uses libsodium, now located robustly via
