@@ -29,6 +29,11 @@ All notable changes to PKCrypt are documented here. This project follows
 
 ### Fixed
 
+- **Malformed RSA public keys are refused (C++).** The C++ CLI now applies the
+  checks Python already did (n odd, e odd, 3 ≤ e < n) when loading a recipient
+  key and again before encrypting. A bogus key such as e = 1 makes RSA-OAEP the
+  identity, so the wrapped session key would have been readable by anyone. Both
+  tools exit 2 (unusable key).
 - **Oversized folders fail immediately.** A file over the classic-ZIP limit
   (4 GiB in C++, 2 GiB in Python) or more than 65,534 entries is caught before
   anything is compressed; previously C++ failed only after compressing 4 GiB.

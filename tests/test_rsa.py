@@ -11,7 +11,10 @@ cannot decrypt the other's file.
 
 from __future__ import annotations
 
+import base64
+import struct
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -154,3 +157,43 @@ def test_cli_folder_roundtrip(rsa4096, tmp_path):
     assert _cli_decrypt(rsa4096["priv_path"], ct, out) == 0
     assert (out / "a.txt").read_bytes() == b"alpha"
     assert (out / "sub" / "b.bin").read_bytes() == b"beta beta"
+
+
+# ---------------------------------------------------------------------------
+# Malformed RSA public keys are refused by both implementations
+# ---------------------------------------------------------------------------
+
+_ROOT = Path(__file__).resolve().parent.parent
+_BIN = _ROOT / "pkcrypt"
+
+
+def _mpint(v: int) -> bytes:
+    b = v.to_bytes((v.bit_length() + 8) // 8, "big")    # keeps a leading 0x00 if the top bit is set
+    return struct.pack(">I", len(b)) + b
+
+
+def _ssh_rsa_pub(e: int, n: int) -> str:
+    t = b"ssh-rsa"
+    blob = struct.pack(">I", len(t)) + t + _mpint(e) + _mpint(n)
+    return f"ssh-rsa {base64.b64encode(blob).decode()} bogus\n"
+
+
+@pytest.mark.parametrize("tool", ["py", "cpp"])
+@pytest.mark.parametrize("case", ["e=1", "e=2", "e even", "e=n"])
+def test_malformed_rsa_public_key_refused(tmp_path, tool, case):
+    """e = 1 would make RSA-OAEP the identity (the session key in the clear);
+    even e, e < 3 or e >= n are not valid RSA keys. Encryption must refuse."""
+    if tool == "cpp" and not _BIN.exists():
+        pytest.skip("C++ binary not built")
+    n = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key().public_numbers().n
+    e = {"e=1": 1, "e=2": 2, "e even": 65536, "e=n": n}[case]
+    pub = tmp_path / "bad.pub"
+    pub.write_text(_ssh_rsa_pub(e, n))
+    payload = tmp_path / "p.txt"
+    payload.write_text("secret")
+    cmd = [sys.executable, "-m", "pkcrypt_lib"] if tool == "py" else [str(_BIN)]
+    r = subprocess.run([*cmd, "encrypt", str(pub), str(payload)], capture_output=True,
+                       text=True, cwd=_ROOT)
+    assert r.returncode == 2, r.stdout + r.stderr          # key error, both tools
+    assert "Traceback" not in r.stderr
+    assert not (tmp_path / "p.txt.pkcrypt").exists()

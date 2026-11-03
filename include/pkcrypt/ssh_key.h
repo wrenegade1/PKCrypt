@@ -47,6 +47,12 @@ std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
                                                      std::string& error,
                                                      const char* passphrase = nullptr);
 
+// True if (n, e) are well-formed RSA public numbers: n odd, e odd, 3 <= e < n
+// (big-endian; leading zeros ignored). Otherwise sets `error`. These are the
+// checks Python's `cryptography` applies when it loads a key.
+bool rsa_public_numbers_ok(const unsigned char* n, size_t n_len,
+                           const unsigned char* e, size_t e_len, std::string& error);
+
 // Parse an OpenSSH RSA *public* key file ("ssh-rsa <b64> <comment>") into the
 // raw modulus/exponent. Returns the key, or std::nullopt on failure.
 std::optional<RsaKey> parse_ssh_rsa_public_key_file(const std::string& path,

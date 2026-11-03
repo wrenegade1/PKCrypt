@@ -366,6 +366,22 @@ void strip_sign(std::vector<unsigned char>& v) {
     v.erase(v.begin(), v.begin() + i);
 }
 
+// Reject malformed RSA public numbers before encrypting to them - the same
+// checks Python's `cryptography` applies when loading a key: n odd, e odd,
+// 3 <= e < n. A bogus key such as e = 1 makes RSA-OAEP the identity, so the
+// "wrapped" session key would be readable by anyone. Inputs are big-endian.
+bool rsa_public_numbers_ok(const unsigned char* n, size_t n_len,
+                           const unsigned char* e, size_t e_len, std::string& error) {
+    while (n_len > 0 && n[0] == 0) { ++n; --n_len; }
+    while (e_len > 0 && e[0] == 0) { ++e; --e_len; }
+    const auto bad = [&] { error = "invalid RSA public key (bad exponent or modulus)"; return false; };
+    if (n_len == 0 || e_len == 0) return bad();
+    if ((n[n_len - 1] & 1) == 0 || (e[e_len - 1] & 1) == 0) return bad();     // both odd
+    if (e_len == 1 && e[0] < 3) return bad();                                   // e >= 3
+    if (e_len > n_len || (e_len == n_len && std::memcmp(e, n, n_len) >= 0)) return bad();  // e < n
+    return true;
+}
+
 std::optional<RsaKey> parse_ssh_rsa_public_key_file(const std::string& path,
                                                     std::string& error) {
     std::ifstream f(path);
@@ -400,6 +416,9 @@ std::optional<RsaKey> parse_ssh_rsa_public_key_file(const std::string& path,
     strip_sign(key.n);
     if (key.n.empty() || key.n.size() < 256) {
         error = "RSA public key too small (need at least 2048 bits)";
+        return std::nullopt;
+    }
+    if (!rsa_public_numbers_ok(key.n.data(), key.n.size(), key.e.data(), key.e.size(), error)) {
         return std::nullopt;
     }
     return key;

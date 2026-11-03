@@ -6,6 +6,7 @@
 //
 
 #include "pkcrypt/crypto.h"
+#include "pkcrypt/ssh_key.h"
 
 #include <cstring>
 #include <algorithm>
@@ -596,6 +597,7 @@ bool RSAStreamEncryptor::begin(ByteSink& out, const unsigned char* rsa_n, size_t
 #else
     wipe();
     if (modulus_bytes < 256) { error = "RSA key too small (need at least 2048 bits)"; return false; }
+    if (!rsa_public_numbers_ok(rsa_n, n_len, rsa_e, e_len, error)) return false;
     if (cipher != CIPHER_AES && cipher != CIPHER_XCHACHA20) { error = "unsupported cipher"; return false; }
     if (payload_type != PAYLOAD_FILE && payload_type != PAYLOAD_ARCHIVE) { error = "unsupported payload type"; return false; }
     if (chunk_len == 0 || chunk_len > MAX_ACCEPTED_CHUNK_LEN) { error = "chunk_len must be between 1 and 16 MiB"; return false; }
