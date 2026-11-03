@@ -238,7 +238,7 @@ in `~/.ssh`.
 ```bash
 # Bob:
 cat ~/.ssh/id_ed25519.pub
-# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... bob@macbook
+# ssh-ed25519 XXXXYYYYZZZZ... bob@macbook
 ```
 
 Bob sends that single line to Alice (email, chat — it's public anyway).
