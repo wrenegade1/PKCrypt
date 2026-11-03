@@ -75,6 +75,10 @@ class AtomicOutput:
     def write(self, data: bytes) -> None:
         self._fh.write(data)
 
+    def fileno(self) -> int:
+        """The temp file's descriptor (to identify it by device + inode)."""
+        return self._fh.fileno()
+
     def retarget(self, path: str | Path) -> None:
         """Publish to ``path`` instead of the path given at creation (same
         no-clobber rule; it must be in the same directory)."""

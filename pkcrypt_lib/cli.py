@@ -75,6 +75,10 @@ def _build_parser() -> argparse.ArgumentParser:
     enc.add_argument("input_file", help="file or folder to encrypt")
     enc.add_argument("output_file", nargs="?", default=None,
                      help="output path (default: <input>.pkcrypt)")
+    enc.add_argument("--skip-large", action="store_true",
+                     help="when encrypting a folder, leave out files too large for "
+                          "its ZIP archive (over 2 GiB) instead of failing; each "
+                          "one is listed as a warning")
 
     dec = sub.add_parser("decrypt", help="decrypt a file with your private key")
     dec.add_argument("private_key",
@@ -90,6 +94,14 @@ def _build_parser() -> argparse.ArgumentParser:
                           "file) instead of refusing it; a partial result goes to "
                           "<name>.partial and exits with status 3")
     return parser
+
+
+def _human_size(n: int) -> str:
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return f"{n} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1000
+    return ""  # unreachable
 
 
 def cmd_encrypt(args) -> int:
@@ -114,8 +126,16 @@ def cmd_encrypt(args) -> int:
                       core.StreamEncryptor(out.write, pub_bytes,
                                            payload_type=core.PAYLOAD_ARCHIVE))
             try:
-                archive.pack_directory(args.input_file, writer, stats)
+                own = os.fstat(out.fileno())
+                archive.pack_directory(args.input_file, writer, stats,
+                                       skip_large=args.skip_large,
+                                       exclude=(own.st_dev, own.st_ino))
                 writer.close()
+            except archive.FileTooLarge as exc:
+                raise archive.FileTooLarge(
+                    f"{exc} - pass --skip-large to leave such files out, or "
+                    f"encrypt the large file on its own (single files have no "
+                    f"size limit)") from None
             finally:
                 writer.abort()
         else:
@@ -129,11 +149,16 @@ def cmd_encrypt(args) -> int:
     for path in stats.skipped:
         print(f"warning: skipped {_display_safe(path)} (symbolic link or special file)",
               file=sys.stderr)
+    for path, size in stats.too_large:
+        print(f"warning: skipped {_display_safe(path)} ({_human_size(size)}, over the "
+              f"2 GiB ZIP limit) - it is NOT in {out_path}", file=sys.stderr)
     print(f"Encrypted {args.input_file} -> {out_path}")
     print(f"  recipient : {args.recipient_public_key}")
     if is_dir:
         print(f"  contents  : {stats.files} files, {stats.directories} folders, "
               f"{stats.bytes} bytes before compression")
+        if stats.too_large:
+            print(f"  left out  : {len(stats.too_large)} large file(s) - see warnings")
     print(f"  size      : {container_size} bytes")
     print(f"Send {out_path} to the recipient. Only they can decrypt it.")
     return 0

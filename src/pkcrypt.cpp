@@ -42,7 +42,7 @@ void usage(const char* prog) {
         << " - encrypt files so that only the holder of a private key can decrypt them.\n\n"
         << "Uses the holder's existing Ed25519 SSH keypair (~/.ssh/id_ed25519).\n\n"
         << "USAGE\n"
-        << "  " << prog << " encrypt <recipient_pubkey> <file|folder> [out.pkcrypt]\n"
+        << "  " << prog << " encrypt [--skip-large] <recipient_pubkey> <file|folder> [out.pkcrypt]\n"
         << "  " << prog << " decrypt [--salvage] <private_key> <file.pkcrypt> [out]\n"
         << "  " << prog << " decrypt --passphrase [--salvage] <private_key> <file.pkcrypt> [out]\n"
         << "  " << prog << " version\n\n"
@@ -55,6 +55,11 @@ void usage(const char* prog) {
         << "  # and recreated as a folder when decrypted:\n"
         << "  " << prog << " encrypt alice_id_ed25519.pub photos/\n"
         << "  " << prog << " decrypt ~/.ssh/id_ed25519 photos.pkcrypt\n\n"
+        << "SKIP LARGE\n"
+        << "  A folder is packed as a ZIP, which holds files up to 4 GiB (ZIP64 is not\n"
+        << "  supported yet). encrypt --skip-large leaves larger files out instead of\n"
+        << "  failing, with a warning naming each one; their folders are still kept.\n"
+        << "  Encrypt a large file on its own - single files have no size limit.\n\n"
         << "SALVAGE\n"
         << "  decrypt --salvage recovers what it can from a damaged file instead of\n"
         << "  refusing it: every file inside that still verifies, or the verified\n"
@@ -161,9 +166,25 @@ std::string container_kind_of(const std::string& path) {
     return "";
 }
 
-int cmd_encrypt(const std::vector<std::string>& args) {
+// "5.7 GB" style (decimal units, like Finder).
+std::string human_size(uint64_t n) {
+    if (n < 1000) return std::to_string(n) + " bytes";
+    const char* units[] = {"KB", "MB", "GB"};
+    double v = static_cast<double>(n);
+    int u = -1;
+    do { v /= 1000; ++u; } while (v >= 1000 && u < 2);
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.1f %s", v, units[u]);
+    return buf;
+}
+
+int cmd_encrypt(std::vector<std::string> args) {
+    const auto flag = std::find(args.begin(), args.end(), "--skip-large");
+    const bool skip_large = flag != args.end();
+    if (skip_large) args.erase(flag);
     if (args.size() < 2) {
-        std::cerr << "usage: pkcrypt encrypt <recipient_pubkey> <file|folder> [out.pkcrypt]\n";
+        std::cerr << "usage: pkcrypt encrypt [--skip-large] <recipient_pubkey> <file|folder> "
+                     "[out.pkcrypt]\n";
         return RC_USAGE;
     }
     std::string pub_path = args[0], in_path = args[1];
@@ -183,6 +204,12 @@ int cmd_encrypt(const std::vector<std::string>& args) {
     AtomicFile out;
     ArchiveStats stats;
     bool ok = out.open(out_path, error);
+    // The output may be inside the folder being encrypted: identify its temp
+    // file by device + inode so the packer leaves it out.
+    struct stat own_st{};
+    auto own_output = [&](const AtomicFile& f) -> const struct stat* {
+        return ::fstat(f.fd(), &own_st) == 0 ? &own_st : nullptr;
+    };
 
     if (rsa) {
         auto key = parse_ssh_rsa_public_key_file(pub_path, error);
@@ -191,7 +218,7 @@ int cmd_encrypt(const std::vector<std::string>& args) {
         ok = ok && enc.begin(out, key->n.data(), key->n.size(), key->e.data(), key->e.size(),
                              key->modulus_bytes(), is_dir ? PAYLOAD_ARCHIVE : PAYLOAD_FILE,
                              error);
-        if (ok && is_dir) ok = pack_directory(in_path, enc, stats, error);
+        if (ok && is_dir) ok = pack_directory(in_path, enc, stats, error, own_output(out), skip_large);
         else if (ok) ok = stream_file(in_path, enc, error);
         ok = ok && enc.finish(error) && out.commit(error);
     } else {
@@ -199,17 +226,27 @@ int cmd_encrypt(const std::vector<std::string>& args) {
         if (!key) { std::cerr << "error: " << display_safe(error) << "\n"; return RC_USAGE; }
         StreamEncryptor enc;
         ok = ok && enc.begin(out, key->public_key, is_dir ? PAYLOAD_ARCHIVE : PAYLOAD_FILE, error);
-        if (ok && is_dir) ok = pack_directory(in_path, enc, stats, error);
+        if (ok && is_dir) ok = pack_directory(in_path, enc, stats, error, own_output(out), skip_large);
         else if (ok) ok = stream_file(in_path, enc, error);
         ok = ok && enc.finish(error) && out.commit(error);
     }
 
     if (!ok) {
-        std::cerr << "error: " << display_safe(error) << "\n";
+        std::cerr << "error: " << display_safe(error);
+        if (is_dir && error.rfind("file too large", 0) == 0) {
+            std::cerr << " - pass --skip-large to leave such files out, or encrypt the "
+                         "large file on its own (single files have no size limit)";
+        }
+        std::cerr << "\n";
         return RC_FAILURE;
     }
     for (const std::string& s : stats.skipped) {
         std::cerr << "warning: skipped " << display_safe(s) << " (symbolic link or special file)\n";
+    }
+    for (const auto& [name, size] : stats.too_large) {
+        std::cerr << "warning: skipped " << display_safe(name) << " (" << human_size(size)
+                  << ", over the 4 GiB ZIP limit) - it is NOT in " << display_safe(out_path)
+                  << "\n";
     }
 
     std::cout << "Encrypted " << in_path << " -> " << out_path << "\n"
@@ -217,6 +254,10 @@ int cmd_encrypt(const std::vector<std::string>& args) {
     if (is_dir) {
         std::cout << "  contents : " << stats.files << " files, " << stats.directories
                   << " folders, " << stats.bytes << " bytes before compression\n";
+        if (!stats.too_large.empty()) {
+            std::cout << "  left out : " << stats.too_large.size()
+                      << " large file(s) - see warnings\n";
+        }
     }
     std::cout << "  size: " << out.size() << " bytes\n"
               << "Hand " << out_path << " to the recipient; only they can decrypt it.\n";

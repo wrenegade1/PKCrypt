@@ -15,10 +15,12 @@ from __future__ import annotations
 import io
 import os
 import random
+import re
 import stat
 import struct
 import subprocess
 import sys
+import time
 import warnings
 import zipfile
 import zlib
@@ -87,6 +89,128 @@ def make_library(root: Path) -> None:
 def leftovers(parent: Path) -> list[str]:
     """Temp files/dirs our tools create (all dot-prefixed with 'pkcrypt')."""
     return [p.name for p in parent.iterdir() if p.name.startswith(".") and "pkcrypt" in p.name]
+
+
+# ---------------------------------------------------------------------------
+# Classic-ZIP limits (ZIP64 is not supported yet)
+# ---------------------------------------------------------------------------
+
+def _many_files(root: Path, n: int) -> Path:
+    root.mkdir()
+    for i in range(n):
+        (root / f"{i:05d}").touch()
+    return root
+
+
+@pytest.fixture(scope="module")
+def max_entries_lib(tmp_path_factory):
+    """Exactly the classic-ZIP entry limit: 65534 (0xFFFF is the ZIP64 sentinel)."""
+    return _many_files(tmp_path_factory.mktemp("maxent") / "lib", 0xFFFE)
+
+
+@pytest.fixture(scope="module")
+def over_entries_lib(tmp_path_factory):
+    return _many_files(tmp_path_factory.mktemp("overent") / "lib", 0xFFFF)
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_oversized_file_refused_before_packing(keys, tmp_path, tool):
+    """A >4 GiB file fails at once from the pre-flight, not after compressing
+    4 GiB of it (a sparse file reads as zeros, so packing it would take minutes)."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "small.txt").write_text("x")
+    with open(lib / "huge.bak", "wb") as f:
+        f.truncate(5 * 1024 ** 3)                    # sparse: no disk space used
+    t0 = time.monotonic()
+    r = cli(tool, "encrypt", keys["pub"], lib)
+    assert time.monotonic() - t0 < 10
+    assert r.returncode == 1, r.stderr
+    assert "too large" in r.stderr and "ZIP64" in r.stderr and "huge.bak" in r.stderr
+    assert "Traceback" not in r.stderr
+    assert not (tmp_path / "lib.pkcrypt").exists() and leftovers(tmp_path) == []
+
+
+def test_python_member_limit_is_2gib(keys, tmp_path):
+    """zipfile without ZIP64 caps members at 2 GiB - 1; the Python packer must
+    refuse above that rather than write ZIP64 the C++ reader can't open."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    with open(lib / "big", "wb") as f:
+        f.truncate(zipfile.ZIP64_LIMIT + 1)
+    r = cli("py", "encrypt", keys["pub"], lib)
+    assert r.returncode == 1 and "limit 2 GiB" in r.stderr, r.stderr
+    assert not (tmp_path / "lib.pkcrypt").exists() and leftovers(tmp_path) == []
+
+
+# Each packer's per-file limit: C++ 4 GiB - 2; Python zipfile 2 GiB - 1.
+_MEMBER_LIMIT = {"cpp": 0xFFFFFFFE, "py": zipfile.ZIP64_LIMIT}
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_skip_large_leaves_out_big_files(keys, tmp_path, tool):
+    """--skip-large: an oversized file is left out with a warning, its folder
+    is still archived, and everything else round-trips through both tools.
+    The flag is given last, as users type it."""
+    lib = tmp_path / "lib"
+    (lib / "backups").mkdir(parents=True)
+    (lib / "sql").mkdir()
+    (lib / "sql" / "restore.sql").write_text("RESTORE DATABASE x;")
+    with open(lib / "backups" / "db.bak", "wb") as f:
+        f.truncate(_MEMBER_LIMIT[tool] + 1)              # sparse, just over the limit
+    r = cli(tool, "encrypt", keys["pub"], lib)
+    assert r.returncode == 1 and "--skip-large" in r.stderr and "\\x0a" not in r.stderr
+    assert not (tmp_path / "lib.pkcrypt").exists()
+    t0 = time.monotonic()
+    r = cli(tool, "encrypt", keys["pub"], lib, "--skip-large")
+    assert time.monotonic() - t0 < 10                  # never read the big file
+    assert r.returncode == 0, r.stderr
+    assert "skipped backups/db.bak" in r.stderr and "NOT in" in r.stderr
+    assert re.search(r"left out\s*: 1 ", r.stdout), r.stdout
+    for dec in TOOLS:
+        out = tmp_path / f"out_{dec}"
+        assert cli(dec, "decrypt", keys["priv"], tmp_path / "lib.pkcrypt", out).returncode == 0
+        assert tree(out) == {"backups": None, "sql": None,
+                             "sql/restore.sql": b"RESTORE DATABASE x;"}
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_output_inside_source_is_not_packed(keys, tmp_path, tool):
+    """Encrypting '.' into a file inside it must not pack its own temp file."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    (lib / "f").write_text("x")
+    cmd = [sys.executable, "-m", "pkcrypt_lib"] if tool == "py" else [str(BIN)]
+    r = subprocess.run([*cmd, "encrypt", keys["pub"], ".", "inside.pkcrypt"],
+                       cwd=lib, capture_output=True, text=True,
+                       env=dict(os.environ, PYTHONPATH=str(ROOT)))
+    assert r.returncode == 0, r.stderr
+    out = tmp_path / "out"
+    assert cli(tool, "decrypt", keys["priv"], lib / "inside.pkcrypt", out).returncode == 0
+    assert tree(out) == {"f": b"x"}
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_too_many_entries_refused_before_packing(keys, tmp_path, over_entries_lib, tool):
+    out = tmp_path / "lib.pkcrypt"
+    r = cli(tool, "encrypt", keys["pub"], over_entries_lib, out)
+    assert r.returncode == 1, r.stderr
+    assert "too many files" in r.stderr and "65534" in r.stderr
+    assert not out.exists() and leftovers(tmp_path) == []
+
+
+@pytest.mark.parametrize("enc,dec", [(e, d) for e in TOOLS for d in TOOLS])
+def test_max_entries_round_trip(keys, tmp_path, max_entries_lib, enc, dec):
+    """At exactly the limit, an archive one tool writes the other can read
+    (the C++ writer used to allow 65535, which its own reader then refused)."""
+    container = tmp_path / "lib.pkcrypt"
+    r = cli(enc, "encrypt", keys["pub"], max_entries_lib, container)
+    assert r.returncode == 0, r.stderr
+    dest = tmp_path / "out"
+    r = cli(dec, "decrypt", keys["priv"], container, dest)
+    assert r.returncode == 0, r.stderr
+    assert sorted(p.name for p in dest.iterdir()) == sorted(
+        p.name for p in max_entries_lib.iterdir())
 
 
 # ---------------------------------------------------------------------------

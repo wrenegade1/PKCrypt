@@ -63,6 +63,8 @@ public:
     bool commit(std::string& error);
     void abort();
     uint64_t size() const { return written_; }
+    // The temp file's descriptor (to identify it by device + inode).
+    int fd() const { return fd_; }
     // Publish to `path` instead of the path given to open().
     void set_destination(const std::string& path) { path_ = path; }
 

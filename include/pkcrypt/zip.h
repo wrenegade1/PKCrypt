@@ -26,6 +26,13 @@
 
 namespace pkcrypt {
 
+// Classic (non-ZIP64) limits, shared by the writer, the reader and the folder
+// packer's pre-flight check. 0xFFFF and 0xFFFFFFFF are the ZIP64 "see the
+// extra field" sentinels - the reader refuses them - so the largest usable
+// values are one less. ZIP64 is not supported yet.
+constexpr uint64_t ZIP_MAX_FILE_SIZE = 0xFFFFFFFEull;    // bytes per file
+constexpr size_t ZIP_MAX_ENTRIES = 0xFFFE;              // files + folders
+
 // Writes a ZIP archive to a sink as entries are added. File contents are
 // streamed through the DEFLATE compressor, so nothing is held in memory
 // beyond small buffers. Because sizes and CRCs are only known afterwards, each

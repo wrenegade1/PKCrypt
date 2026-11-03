@@ -22,6 +22,24 @@ All notable changes to PKCrypt are documented here. This project follows
   passphrase-protected RSA-4096 key verified C++ → Python, C++ → C++, and
   Python → C++ decryption of a 2.56 MB binary payload, with byte-identical
   results and no passphrase echo at the C++ terminal prompt.
+- **`encrypt --skip-large`** (Python and C++): when encrypting a folder, leave
+  out files too large for its ZIP archive instead of failing. Each one is named
+  in a warning, the summary counts them, and their folders are still kept.
+  Flags may go anywhere on the command line.
+
+### Fixed
+
+- **Oversized folders fail immediately.** A file over the classic-ZIP limit
+  (4 GiB in C++, 2 GiB in Python) or more than 65,534 entries is caught before
+  anything is compressed; previously C++ failed only after compressing 4 GiB.
+- **Python never writes ZIP64.** `zipfile` used ZIP64 for members over 2 GiB,
+  which the C++ reader refuses; Python now writes only classic ZIP, and its
+  limit errors are reported normally instead of as a traceback.
+- **Entry-count off-by-one (C++):** the writer allowed 65,535 entries, which is
+  the ZIP64 sentinel its own reader rejects; the limit is now 65,534.
+- **Encrypting a folder into a file inside it** (e.g. `encrypt key.pub . out.pkcrypt`)
+  no longer packs the in-progress output into the archive, in either
+  implementation; the output is recognised by device and inode.
 
 ## [2.1.0] - 2026-10-30
 

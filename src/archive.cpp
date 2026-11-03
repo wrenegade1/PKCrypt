@@ -181,7 +181,7 @@ bool extract_into(const std::string& root, int archive_fd,
 } // namespace
 
 bool pack_directory(const std::string& dir_arg, ByteSink& out, ArchiveStats& stats,
-                    std::string& error) {
+                    std::string& error, const struct stat* exclude, bool skip_large) {
     const std::string dir = strip_trailing_slashes(dir_arg);
     struct stat root_st;
     if (::stat(dir.c_str(), &root_st) != 0 || !S_ISDIR(root_st.st_mode)) {
@@ -209,7 +209,9 @@ bool pack_directory(const std::string& dir_arg, ByteSink& out, ArchiveStats& sta
         if (S_ISDIR(st.st_mode)) {
             items.push_back({rel + "/", p.string(), true, st});
         } else if (S_ISREG(st.st_mode)) {
-            items.push_back({rel, p.string(), false, st});
+            const bool own_output = exclude && st.st_dev == exclude->st_dev &&
+                                    st.st_ino == exclude->st_ino;
+            if (!own_output) items.push_back({rel, p.string(), false, st});
         } else {
             stats.skipped.push_back(rel);           // symlink, socket, device...
         }
@@ -218,6 +220,32 @@ bool pack_directory(const std::string& dir_arg, ByteSink& out, ArchiveStats& sta
     }
     std::sort(items.begin(), items.end(),
               [](const Item& a, const Item& b) { return a.name < b.name; });
+
+    // Pre-flight the classic-ZIP limits from the sizes already stat'ed, so an
+    // oversized folder fails at once instead of after compressing 4 GiB. The
+    // writer still enforces them while streaming (a file may grow meanwhile),
+    // and the 4 GiB whole-archive limit, which depends on compression, is
+    // only knowable there.
+    std::vector<Item> kept;
+    kept.reserve(items.size());
+    for (Item& item : items) {
+        const auto size = static_cast<uint64_t>(item.st.st_size);
+        if (!item.is_dir && size > ZIP_MAX_FILE_SIZE) {
+            if (!skip_large) {
+                return fail(error, "file too large for a ZIP archive (limit 4 GiB; "
+                                   "ZIP64 is not supported): " + item.name);
+            }
+            stats.too_large.emplace_back(item.name, size);
+            continue;
+        }
+        kept.push_back(std::move(item));
+    }
+    items.swap(kept);
+    if (items.size() > ZIP_MAX_ENTRIES) {
+        return fail(error, "too many files and folders for a ZIP archive (" +
+                           std::to_string(items.size()) +
+                           "; limit 65534; ZIP64 is not supported)");
+    }
 
     ZipWriter writer(out);
     for (const Item& item : items) {

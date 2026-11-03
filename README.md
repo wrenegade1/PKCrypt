@@ -252,6 +252,7 @@ Encrypt-only options:
 | Flag | Meaning |
 |------|---------|
 | `encrypt <pub> <file> [out]` | Third positional arg overrides the output path. |
+| `--skip-large` | When encrypting a folder, leave out files too large for its ZIP archive instead of failing; each is named in a warning (see [Encrypting folders](#encrypting-folders)). Flags may go anywhere on the command line. |
 
 Decrypt-only options:
 
@@ -279,6 +280,20 @@ the folder. Both implementations do this and read each other's output.
 - **What's included:** every regular file and folder (including empty ones), with
   paths relative to the folder you named, in sorted order. **Symbolic links and
   special files are skipped** with a warning; links are never followed.
+- **Size limits (no ZIP64 yet):** the archive uses classic ZIP, which holds up to
+  65,534 files and folders, and files up to **4 GiB** each (C++) or **2 GiB** each
+  (Python, whose `zipfile` cannot go higher without ZIP64). A folder over a
+  limit fails immediately, before anything is compressed. Pass `--skip-large` to
+  leave oversized files out instead: each is named in a `warning: skipped …` line
+  and the summary shows how many were left out; their folders are still kept.
+  Encrypt a large file **on its own**: single files have no size limit.
+
+  ```bash
+  pkcrypt encrypt --skip-large ~/.ssh/id_ed25519.pub T10Restore     # folder minus the big .bak
+  pkcrypt encrypt ~/.ssh/id_ed25519.pub T10Restore/backups/db.bak ~/db.bak.pkcrypt
+  ```
+- **The output can live inside the folder** (e.g. `pkcrypt encrypt key.pub . out.pkcrypt`):
+  the container being written is recognised by device and inode and never packed into itself.
 - **What's restored:** contents, folder structure, and modification times. Files are
   created `0600` (`0700` if they were owner-executable), folders `0700`: decrypted
   data is private to you, like any PKCrypt output.
@@ -295,8 +310,8 @@ The compression is an in-house DEFLATE (RFC 1951) and ZIP (PKWARE APPNOTE)
 implementation in C++; Python uses its standard library's `zipfile`/`zlib`. The
 decrypted archive is a standard ZIP, so you can also verify one with any ZIP tool.
 
-Everything streams, so folder size is limited by disk space, not memory. When
-encrypting, files are compressed straight into the encryptor, so no plaintext
+Everything streams, so memory use stays small whatever the folder size (within the
+ZIP limits above). When encrypting, files are compressed straight into the encryptor, so no plaintext
 archive is written to disk. When decrypting, a ZIP's index sits at its end, so
 the decrypted archive goes to a private (`0600`) temporary file beside the
 destination; it is extracted from there and always deleted afterwards.
@@ -624,6 +639,14 @@ All suites generate throwaway keys in a temp directory and never touch your real
 
 ## Troubleshooting
 
+### `error: file too large for a ZIP archive (limit 4 GiB; ZIP64 is not supported)`
+A file in the folder is over the archive's per-file limit (4 GiB in C++, 2 GiB in
+Python). Re-run with `--skip-large` to encrypt the folder without it, and encrypt
+that file on its own (single files have no size limit).
+
+### `error: [Errno 2] No such file or directory: 'ssh-ed25519'`
+The key argument is the **path to the key file** (`~/.ssh/id_ed25519.pub`), not the
+key's text. Pasting the key splits it into several arguments.
 
 ### `error: decryption failed: file is not for this private key, or it was tampered with or truncated`
 You are using the **wrong private key**, or the `.pkcrypt` file was **modified** or

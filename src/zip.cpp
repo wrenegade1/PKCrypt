@@ -155,8 +155,9 @@ bool ZipWriter::begin_entry(Central& c, std::string& error) {
         return fail(error, "cannot archive '" + c.name + "': " + why);
     }
     if (c.name.size() > MAX_16) return fail(error, "file name too long for ZIP: " + c.name);
-    if (central_.size() >= MAX_16) {
-        return fail(error, "too many files for a ZIP archive (limit 65535; ZIP64 is not supported)");
+    // An entry count of 0xFFFF is the ZIP64 sentinel the reader refuses.
+    if (central_.size() >= ZIP_MAX_ENTRIES) {
+        return fail(error, "too many files for a ZIP archive (limit 65534; ZIP64 is not supported)");
     }
     c.offset = static_cast<uint32_t>(offset_);
 
@@ -225,7 +226,7 @@ bool ZipWriter::add_file(const std::string& name, uint32_t mode, std::time_t mti
         } else {
             crc = crc32(buf.data(), static_cast<size_t>(n), crc);
             size += static_cast<uint64_t>(n);
-            if (size >= MAX_32) {
+            if (size > ZIP_MAX_FILE_SIZE) {     // the file grew after pre-flight
                 return fail(error, "file too large for a ZIP archive (limit 4 GiB; "
                                    "ZIP64 is not supported): " + name);
             }

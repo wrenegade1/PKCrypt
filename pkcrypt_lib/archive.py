@@ -46,9 +46,22 @@ _SIG_EOCD = 0x06054B50
 _SIG_DATA_DESCRIPTOR = 0x08074B50
 _COPY_BLOCK = 1 << 20
 
+# Classic (non-ZIP64) limits. The C++ reader refuses ZIP64 archives, so the
+# packer must never produce one. An entry count of 0xFFFF is the ZIP64
+# sentinel, hence 65534. With allowZip64=False, zipfile caps member sizes and
+# offsets at 2 GiB - 1 (stricter than the C++ packer's 4 GiB), so a Python-made
+# archive is limited to ~2 GiB until ZIP64 is implemented.
+_ZIP_MAX_ENTRIES = 0xFFFE
+_ZIP_MAX_MEMBER = zipfile.ZIP64_LIMIT
+_NO_ZIP64 = "ZIP64 is not supported"
+
 
 class ArchiveError(ValueError):
     """The archive is malformed or unsafe to extract."""
+
+
+class FileTooLarge(ArchiveError):
+    """A file in the folder is over the classic-ZIP member limit."""
 
 
 @dataclass
@@ -57,6 +70,8 @@ class ArchiveStats:
     directories: int = 0
     bytes: int = 0
     skipped: list[str] = field(default_factory=list)
+    # Left out by ``skip_large``: (archive name, size in bytes).
+    too_large: list[tuple[str, int]] = field(default_factory=list)
 
 
 def has_usable_name(path: str) -> bool:
@@ -88,16 +103,26 @@ def name_is_safe(name: str) -> str | None:
 # Packing
 # ---------------------------------------------------------------------------
 
-def pack_directory(directory: str, out, stats: ArchiveStats) -> None:
+def pack_directory(directory: str, out, stats: ArchiveStats,
+                   skip_large: bool = False,
+                   exclude: tuple[int, int] | None = None) -> None:
     """Write a ZIP archive of ``directory``'s contents to the file-like
     ``out`` (which needs only ``write``/``flush``). Paths are relative to the
     folder, in sorted order; symbolic links and special files are skipped and
-    listed in ``stats.skipped``."""
+    listed in ``stats.skipped``.
+
+    A file over the member limit raises ``FileTooLarge`` - or, with
+    ``skip_large``, is left out and listed in ``stats.too_large`` (its folder
+    is still archived).
+
+    ``exclude`` is the (st_dev, st_ino) of the file being written - the
+    output may sit inside ``directory`` (e.g. encrypting ``.``) and must never
+    pack its own in-progress temp file."""
     root = Path(directory)
     if not root.is_dir():
         raise ArchiveError(f"not a directory: {directory}")
 
-    items: list[tuple[str, Path, bool]] = []
+    items: list[tuple[str, Path, bool, int]] = []
 
     def walk(d: Path, prefix: str) -> None:
         with os.scandir(d) as it:
@@ -105,29 +130,60 @@ def pack_directory(directory: str, out, stats: ArchiveStats) -> None:
                 rel = prefix + entry.name
                 st = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(st.st_mode):
-                    items.append((rel + "/", Path(entry.path), True))
+                    items.append((rel + "/", Path(entry.path), True, 0))
                     walk(Path(entry.path), rel + "/")
                 elif stat.S_ISREG(st.st_mode):
-                    items.append((rel, Path(entry.path), False))
+                    if exclude == (st.st_dev, st.st_ino):
+                        continue                        # our own output file
+                    items.append((rel, Path(entry.path), False, st.st_size))
                 else:
                     stats.skipped.append(rel)
 
     walk(root, "")
     items.sort(key=lambda item: item[0].encode("utf-8", "surrogateescape"))
 
+    # Pre-flight the limits from the sizes already stat'ed, so an oversized
+    # folder fails at once instead of after compressing gigabytes. zipfile
+    # still enforces them while writing (a file may grow meanwhile).
+    for name, _, is_dir, size in items:
+        if not is_dir and size > _ZIP_MAX_MEMBER:
+            if not skip_large:
+                raise FileTooLarge(f"file too large for a ZIP archive "
+                                   f"(limit 2 GiB; {_NO_ZIP64}): {name}")
+            stats.too_large.append((name, size))
+    if stats.too_large:
+        left_out = {name for name, _ in stats.too_large}
+        items = [item for item in items if item[0] not in left_out]
+    if len(items) > _ZIP_MAX_ENTRIES:
+        raise ArchiveError(f"too many files and folders for a ZIP archive "
+                           f"({len(items)}; limit {_ZIP_MAX_ENTRIES}; {_NO_ZIP64})")
+
     # strict_timestamps=False clamps pre-1980 mtimes instead of failing.
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as zf:
-        for name, path, is_dir in items:
-            # Reject here too (matching the C++ packer), so we never produce an
-            # archive the extractor - either implementation - would refuse.
-            if why := name_is_safe(name):
-                raise ArchiveError(f"cannot archive '{name}': {why}")
-            zf.write(path, name)
-            if is_dir:
-                stats.directories += 1
-            else:
-                stats.files += 1
-                stats.bytes += path.stat().st_size
+    # allowZip64=False: never write an archive the C++ reader would refuse.
+    try:
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, allowZip64=False,
+                             strict_timestamps=False) as zf:
+            for name, path, is_dir, _ in items:
+                # Reject here too (matching the C++ packer), so we never produce an
+                # archive the extractor - either implementation - would refuse.
+                if why := name_is_safe(name):
+                    raise ArchiveError(f"cannot archive '{name}': {why}")
+                zf.write(path, name)
+                if is_dir:
+                    stats.directories += 1
+                else:
+                    stats.files += 1
+                    stats.bytes += path.stat().st_size
+    except zipfile.LargeZipFile as exc:
+        # The whole archive passed 2 GiB (depends on compression, so only
+        # knowable while writing). Not a ValueError, so convert it.
+        raise ArchiveError(f"archive too large (limit 2 GiB; {_NO_ZIP64}): {exc}") from None
+    except RuntimeError as exc:
+        # zipfile's "File size too large, try using force_zip64": a file grew
+        # past the limit after pre-flight.
+        if "too large" not in str(exc):
+            raise
+        raise ArchiveError(f"file too large for a ZIP archive (limit 2 GiB; {_NO_ZIP64})") from None
 
 
 # ---------------------------------------------------------------------------

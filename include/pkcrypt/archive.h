@@ -11,6 +11,8 @@
 
 #include <cstdint>
 #include <string>
+#include <sys/stat.h>
+#include <utility>
 #include <vector>
 
 #include "pkcrypt/stream.h"
@@ -22,14 +24,21 @@ struct ArchiveStats {
     size_t directories = 0;
     unsigned long long bytes = 0;           // total uncompressed file bytes
     std::vector<std::string> skipped;       // symlinks / special files (pack)
+    // Left out by `skip_large` (pack): archive name and size in bytes.
+    std::vector<std::pair<std::string, uint64_t>> too_large;
 };
 
 // Stream a ZIP archive of the contents of `dir` (paths relative to it, in
 // sorted order) into `out`, one file at a time. Symbolic links and special
 // files are not followed or stored; their relative paths are listed in
-// `stats.skipped`.
+// `stats.skipped`. `exclude`, if given, is the stat of the file being written:
+// the output may sit inside `dir` (e.g. encrypting ".") and must never pack
+// its own in-progress temp file. A file over the ZIP size limit fails the
+// pack - or, with `skip_large`, is left out and listed in `stats.too_large`
+// (its folder is still archived).
 bool pack_directory(const std::string& dir, ByteSink& out, ArchiveStats& stats,
-                    std::string& error);
+                    std::string& error, const struct stat* exclude = nullptr,
+                    bool skip_large = false);
 
 // Extract the ZIP archive in file `fd` (`size` bytes) into the new directory
 // `dest`, which must not exist. The archive is validated first; entries are
