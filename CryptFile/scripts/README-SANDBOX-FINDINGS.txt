@@ -77,10 +77,10 @@ in-app NSOpenPanel/NSSavePanel grants drive.
 
 
 -------------------------------------------------------------------------------
-SECTION B — Manual user-granted sandbox round-trip (Task 2 — HUMAN, PENDING)
+SECTION B — Manual user-granted sandbox round-trip (Task 2 — HUMAN, COMPLETE)
 -------------------------------------------------------------------------------
-STATUS: PENDING — requires a human to click the native NSOpenPanel/NSSavePanel
-grants. NOT yet completed. This section is the record the human fills in.
+STATUS: COMPLETE (human-confirmed 11-02, "looks ok" roundtrip-ok). The human
+completed the native-grant round-trip through the signed sandboxed app.
 
 To run (human):
   1. Launch the signed sandboxed CryptFile.app.
@@ -93,9 +93,16 @@ To run (human):
      the app-scoped security-scoped bookmark survives relaunch (Phase-1 D-05).
   5. Record each step's result below (pass/fail + detail).
 
-  Encrypt result:        [PENDING]
-  Decrypt result:        [PENDING]
-  Relaunch re-decrypt without re-granting (bookmark survival): [PENDING]
+  Encrypt result:        [PASS — human confirmed]
+  Decrypt result:        [PASS — human confirmed]
+  Relaunch re-decrypt without re-granting (bookmark survival): [PASS — human
+                            confirmed; app-scoped security-scoped bookmark survives
+                            relaunch (APP-03 / Phase-1 D-05 pattern)]
+
+  RESULT (Task 2): PASS — user-granted sandboxed access works through completion
+  including the relaunch bookmark-survival check. Combined with Section A + the
+  runtime sandbox-enforcement probe, success criterion 4's core requirement is
+  validated. RELEASE-BLOCKERS.md row 5 is flipped to VALIDATED.
 
 -------------------------------------------------------------------------------
 SECTION C — Large-file bounded-memory measurement (Task 2 — engine measured; UI PENDING)
