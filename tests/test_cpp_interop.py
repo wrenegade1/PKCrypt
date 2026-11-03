@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Cross-language interoperability tests for PKCrypt.
 
 Author: Warren Zajac

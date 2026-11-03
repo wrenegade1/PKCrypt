@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Generate a large, deterministic test file made of repeating patterns.
 
 Author: Warren Zajac

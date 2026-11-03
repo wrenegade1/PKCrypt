@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Tests for the in-house C++ base64 codec, checked against Python's ``base64``.
 
 Author: Warren Zajac

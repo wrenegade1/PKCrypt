@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 #ifndef CSODIUM_SHIM_H
 #define CSODIUM_SHIM_H
 

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Loading OpenSSH Ed25519 and RSA key files.
 
 Author: Warren Zajac

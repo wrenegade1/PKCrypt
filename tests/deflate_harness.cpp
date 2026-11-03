@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 //
 // PKCrypt - test harness exposing the in-house DEFLATE, CRC-32 and ZIP code to
 // the Python test suite, which checks it against independent implementations

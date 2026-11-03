@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 //
 // PKCrypt - test harness exposing the OpenSSH private-key parser (including
 // passphrase-protected key decryption) to the Python test suite. Built by

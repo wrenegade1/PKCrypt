@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """End-to-end tests for PKCrypt.
 
 Author: Warren Zajac

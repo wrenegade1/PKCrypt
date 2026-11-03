@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 //
 // PKCrypt - encrypt files so that only the holder of an Ed25519 SSH private
 // key can decrypt them (same public/private key model as SSH).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 import SwiftUI
 
 /// Top-level two-tab shell (D-01): an "Encrypt" tab and a "Decrypt" tab, with

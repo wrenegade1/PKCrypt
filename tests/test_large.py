@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Large-input tests (1 GiB by default). Opt-in: they take a while and need a
 few GB of free disk.
 

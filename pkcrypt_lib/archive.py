@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Folder <-> ZIP archive for PKCrypt, using the standard library's zipfile.
 
 Author: Warren Zajac

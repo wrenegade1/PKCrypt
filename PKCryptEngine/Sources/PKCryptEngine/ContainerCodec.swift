@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 import Foundation
 
 /// Byte-exact v2 (Ed25519) container format constants, matching pkcrypt_lib/core.py

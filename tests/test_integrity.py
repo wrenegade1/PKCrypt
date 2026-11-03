@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Cryptographic integrity tests: the container must resist tampering.
 
 Author: Warren Zajac

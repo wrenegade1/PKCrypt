@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 import Foundation
 
 /// Typed error taxonomy for the PKCryptEngine (D-11 / D-12 / D-13).

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Tests for the C++ OpenSSH private-key parser, incl. passphrase-protected keys.
 
 Author: Warren Zajac

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 #ifndef PKCRYPT_VERSION_H
 #define PKCRYPT_VERSION_H
 

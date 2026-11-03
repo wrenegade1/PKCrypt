@@ -5,6 +5,13 @@ All notable changes to PKCrypt are documented here. This project follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Licensed under the Apache License 2.0.** Includes an explicit
+  patent grant and patent-retaliation clause, requires modified files to be
+  marked, and keeps the project names out of the grant. A `NOTICE` file and an
+  `SPDX-License-Identifier: Apache-2.0` header in every source file were added.
+
 ### Added
 
 - **RSA SSH recipient keys** in Python and C++, alongside Ed25519. Supports

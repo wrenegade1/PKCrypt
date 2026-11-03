@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Warren Zajac
 """Tests for the in-house C++ DEFLATE and CRC-32 implementation.
 
 Author: Warren Zajac

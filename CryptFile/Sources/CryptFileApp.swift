@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 import SwiftUI
 
 /// CryptFile application entry point (D-04): a single main window app.

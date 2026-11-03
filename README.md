@@ -769,8 +769,14 @@ Contributions and ideas are welcome — open an issue or a pull request.
 
 **Author and maintainer:** Warren Zajac
 
-PKCrypt is released under the **Apache License, Version 2.0**. See the repository license file for the
-full text.
+PKCrypt is released under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE)
+for the full text and [`NOTICE`](NOTICE) for attribution. Every source file carries an
+`SPDX-License-Identifier: Apache-2.0` header.
+
+In short, you may use, modify, and redistribute PKCrypt, including in commercial and
+closed-source products, provided you keep the license and `NOTICE`, and mark any files
+you change. The license includes an explicit patent grant from contributors and does
+not grant rights to the names "PKCrypt" or "CryptFile".
 
 The base64 encoder/decoder in `src/base64.cpp` is **our own** implementation,
 written in-house and verified byte-for-byte against the standard reference (the
@@ -783,6 +789,8 @@ The implementation relies on (but does not bundle) these third-party libraries:
 |-----------|---------|---------|
 | [libsodium](https://doc.libsodium.org/) | ISC | Ed25519→X25519 conversion, X25519, HKDF, AES-GCM primitives. |
 | [cryptography](https://cryptography.io/) | Apache-2.0 / BSD | OpenSSH key parsing and Python crypto primitives. |
+| [bcrypt](https://github.com/pyca/bcrypt) | Apache-2.0 | Unlocking passphrase-protected OpenSSH keys (Python). |
+| [OpenSSL 3](https://www.openssl.org/) (libcrypto) | Apache-2.0 | RSA-OAEP in the C++ binary (optional; Ed25519 works without it). |
 
 PKCrypt is an independent project and is not affiliated with or endorsed by OpenSSH,
 libsodium, or the Python `cryptography` project.

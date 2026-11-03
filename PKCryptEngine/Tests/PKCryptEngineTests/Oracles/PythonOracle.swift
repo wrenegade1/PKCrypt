@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 import Foundation
 
 // MARK: - Shared oracle-shell plumbing (test-time only, D-04)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Warren Zajac
 import Foundation
 
 /// Cooperative cancellation integration (D-16). Cancellation is observed

@@ -1,0 +1,16 @@
+PKCrypt
+Copyright 2026 Warren Zajac
+
+This product includes software developed by Warren Zajac.
+
+"PKCrypt" and "CryptFile" are names of this project. The Apache License 2.0
+does not grant permission to use these names, except as required for
+reasonable and customary use in describing the origin of the work.
+
+PKCrypt links against, but does not bundle, the following third-party
+libraries, each under its own license:
+
+  libsodium     ISC License                      https://libsodium.org
+  OpenSSL 3     Apache License 2.0               https://www.openssl.org
+  cryptography  Apache License 2.0 or BSD        https://cryptography.io
+  bcrypt        Apache License 2.0               https://github.com/pyca/bcrypt
