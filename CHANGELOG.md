@@ -29,6 +29,9 @@ All notable changes to PKCrypt are documented here. This project follows
 
 ### Fixed
 
+- **`bcrypt` is now a declared dependency.** `cryptography` needs it to open
+  passphrase-protected OpenSSH keys, so a clean `pip install` could not run
+  `decrypt --passphrase` ("Need bcrypt module", exit 2). This was the CI failure.
 - **Malformed RSA public keys are refused (C++).** The C++ CLI now applies the
   checks Python already did (n odd, e odd, 3 ≤ e < n) when loading a recipient
   key and again before encrypting. A bogus key such as e = 1 makes RSA-OAEP the
