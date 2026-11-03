@@ -207,7 +207,8 @@ def ed25519_private_to_x25519_private(seed: bytes, ed_public: bytes) -> bytes:
 #   payload    chunks     per-chunk AEAD ciphertext + auth tag; always >= 1
 #
 # Each chunk's AAD is header || final_flag (0x00, or 0x01 for the last chunk).
-_MAGIC = b"PKCRYPT\x02"
+_MAGIC = b"PKCRYPT\x02"            # Ed25519 (X25519 ECDH) container
+_MAGIC_RSA = b"PKCRYPT\x03"        # RSA (OAEP-wrapped session key) container
 _MAGIC_BYTES = len(_MAGIC)            # 8
 _CIPHER_BYTES = 1
 _PAYLOAD_BYTES = 1
@@ -220,10 +221,20 @@ _TAG_BYTES = 16
 _CIPHER_AES = 0x00
 _CIPHER_XCHACHA20 = 0x01
 
+# RSA container: after magic | cipher | payload there is one algorithm byte.
+_RSA_ALG_OAEP_SHA256 = 0x00        # RSA-OAEP with SHA-256 wrapping a random key
+_RSA_ALG_BYTES = 1
+
 PAYLOAD_FILE = 0x00                 # plaintext is one file's bytes
 PAYLOAD_ARCHIVE = 0x01              # plaintext is a ZIP archive of a folder
 _PAYLOAD_TYPES = (PAYLOAD_FILE, PAYLOAD_ARCHIVE)
 _PREFIX_BYTES = _MAGIC_BYTES + _CIPHER_BYTES + _PAYLOAD_BYTES
+
+# All container magics this build accepts, mapped to a scheme name.
+_MAGICS = {
+    _MAGIC: "ed25519",
+    _MAGIC_RSA: "rsa",
+}
 
 _FLAG_MORE = b"\x00"
 _FLAG_FINAL = b"\x01"
@@ -275,9 +286,16 @@ def _header_size(nonce_len: int) -> int:
     return _PREFIX_BYTES + _EPH_PUB_BYTES + nonce_len + _CHUNK_LEN_BYTES
 
 
-def _parse_prefix(prefix: bytes) -> tuple[int, int]:
-    """Validate magic | cipher | payload; return (cipher, payload_type)."""
-    if not prefix.startswith(_MAGIC):
+def _parse_prefix(prefix: bytes) -> tuple[str, int, int]:
+    """Validate magic | cipher | payload; return (scheme, cipher, payload)."""
+    magic = prefix[: _MAGIC_BYTES]
+    scheme = _MAGICS.get(magic)
+    if scheme is None:
+        # Recognize the old v1 magic to give a more helpful error.
+        if magic == b"PKCRYPT\x01":
+            raise ValueError("this file uses the removed v1 format; re-encrypt it")
+        if magic[:6] == b"PKCRYPT":
+            raise ValueError("not a PKCrypt file (bad header)")
         raise ValueError("not a PKCrypt file (bad header)")
     if len(prefix) < _PREFIX_BYTES:
         raise ValueError("encrypted payload too short or corrupt")
@@ -285,7 +303,7 @@ def _parse_prefix(prefix: bytes) -> tuple[int, int]:
     _nonce_len_for(cipher)
     if payload_type not in _PAYLOAD_TYPES:
         raise ValueError(f"unsupported payload type: {payload_type:#x}")
-    return cipher, payload_type
+    return scheme, cipher, payload_type
 
 
 def peek_payload_type(fileobj) -> int:
@@ -294,7 +312,17 @@ def peek_payload_type(fileobj) -> int:
     container decrypts successfully (it is part of every chunk's AAD)."""
     pos = fileobj.tell()
     try:
-        return _parse_prefix(fileobj.read(_PREFIX_BYTES))[1]
+        return _parse_prefix(fileobj.read(_PREFIX_BYTES))[2]
+    finally:
+        fileobj.seek(pos)
+
+
+def peek_container_kind(fileobj) -> str:
+    """Return the container scheme, "ed25519" or "rsa", leaving the position
+    unchanged. (The magic is authenticated only once the container decrypts.)"""
+    pos = fileobj.tell()
+    try:
+        return _parse_prefix(fileobj.read(_PREFIX_BYTES))[0]
     finally:
         fileobj.seek(pos)
 
@@ -413,7 +441,11 @@ class Decryptor:
     def __init__(self, header: bytes, seed: bytes, ed_public: bytes):
         # Expected header:
         #   magic | cipher | payload | eph_pub | base_nonce | chunk_len
-        cipher, payload_type = _parse_prefix(header)
+        scheme, cipher, payload_type = _parse_prefix(header)
+        if scheme != "ed25519":
+            raise ValueError(
+                "this container is RSA-encrypted; use the corresponding "
+                "private key (not an Ed25519 key)")
         nonce_len = _nonce_len_for(cipher)
         if len(header) != _header_size(nonce_len):
             raise ValueError("encrypted payload too short or corrupt")
@@ -551,17 +583,19 @@ def encrypt_stream(plaintext_iter, recipient_ed25519_public: bytes,
         writer.abort()
 
 
-def decrypt_stream(container_iter, recipient_ed25519_seed: bytes,
-                   recipient_ed25519_public: bytes, salvage: bool = False):
-    """Stream decrypt: yield plaintext chunks from a v2 container supplied as
-    ``container_iter`` (a binary file object or iterable of bytes).
+def _decrypt_stream(container_iter, make_decryptor, header_size_fn, salvage=False):
+    """Shared streaming decrypt: yield plaintext chunks from a container.
 
-    Each chunk is authenticated before it is yielded, but truncation is only
-    detected at the end: do not trust or publish the output until the
-    generator has finished without raising (or, when salvaging, publish what
-    was yielded as a partial result). With ``salvage``, a cut-off stream's
-    last full chunk - which fails as final - is also yielded if it verifies as
-    the non-final chunk it really is, before the error is raised.
+    ``make_decryptor(header)`` builds a scheme-specific Decryptor whose
+    ``block_size`` and ``decrypt_chunk`` drive the loop, and
+    ``header_size_fn(prefix)`` returns the header length given the magic|
+    cipher|payload prefix. Each chunk is authenticated before it is yielded,
+    but truncation is only detected at the end: do not trust or publish the
+    output until the generator has finished without raising (or, when
+    salvaging, publish what was yielded as a partial result). With ``salvage``,
+    a cut-off stream's last full chunk - which fails as final - is also yielded
+    if it verifies as the non-final chunk it really is, before the error is
+    raised.
     """
     pieces = _pieces(container_iter, _READ_SIZE)
     pending = bytearray()
@@ -575,15 +609,17 @@ def decrypt_stream(container_iter, recipient_ed25519_seed: bytes,
             pending.extend(piece)
         return True
 
+    # Best-effort read of the magic|cipher|payload prefix, then let
+    # header_size_fn (which validates the magic via _parse_prefix) compute the
+    # header length. A too-short or wrong magic raises the right error there.
     fill(_PREFIX_BYTES)
-    cipher, _ = _parse_prefix(bytes(pending[:_PREFIX_BYTES]))
-    header_size = _header_size(_nonce_len_for(cipher))
+    header_size = header_size_fn(bytes(pending[:_PREFIX_BYTES]))
     if not fill(header_size):
         raise ValueError("encrypted payload too short or corrupt")
     header = bytes(pending[:header_size])
     del pending[:header_size]
 
-    dec = Decryptor(header, recipient_ed25519_seed, recipient_ed25519_public)
+    dec = make_decryptor(header)
     block = dec.block_size
     try:
         while True:
@@ -611,6 +647,20 @@ def decrypt_stream(container_iter, recipient_ed25519_seed: bytes,
         dec.close()
 
 
+def decrypt_stream(container_iter, recipient_ed25519_seed: bytes,
+                   recipient_ed25519_public: bytes, salvage: bool = False):
+    """Stream decrypt with an Ed25519 private key (see ``_decrypt_stream``)."""
+
+    def make(header: bytes):
+        return Decryptor(header, recipient_ed25519_seed, recipient_ed25519_public)
+
+    def size(prefix: bytes) -> int:
+        _, cipher, _ = _parse_prefix(prefix)
+        return _header_size(_nonce_len_for(cipher))
+
+    yield from _decrypt_stream(container_iter, make, size, salvage)
+
+
 def encrypt_bytes(plaintext: bytes, recipient_ed25519_public: bytes,
                   cipher: int = _CIPHER_AES,
                   chunk_len: int = DEFAULT_CHUNK_LEN,
@@ -628,3 +678,325 @@ def decrypt_bytes(container: bytes, recipient_ed25519_seed: bytes,
     recipient's private key material (seed + public) can decrypt."""
     return b"".join(decrypt_stream([container], recipient_ed25519_seed,
                                    recipient_ed25519_public))
+
+
+# ---------------------------------------------------------------------------
+# RSA recipient keys
+#
+# A second, interoperable container (magic "PKCRYPT\x03") that lets anyone
+# encrypt to a recipient's *RSA public* key; only the holder of the matching
+# *RSA private* key can decrypt. It is a hybrid scheme:
+#
+#   header (AAD for every chunk):
+#     magic       8 bytes   b"PKCRYPT\x03"
+#     cipher      1 byte    0x00 = AES-256-GCM | 0x01 = XChaCha20-Poly1305
+#     payload     1 byte    0x00 = single file | 0x01 = ZIP archive (a folder)
+#     alg         1 byte    0x00 = rsa-oaep-sha256
+#     wrapped_key N bytes   RSA-OAEP(SHA-256) of a random 32-byte session key
+#                           (N = the RSA modulus size: 256 for 2048-bit, ...
+#                           512 for 4096-bit)
+#     base_nonce  12|24 B   AEAD base nonce
+#     chunk_len   4 bytes   max plaintext bytes per chunk, big-endian
+#   payload:
+#     chunks      each AEAD ciphertext = (chunk bytes + 16-byte auth tag)
+#
+# The 32-byte session key is random per file (so forward secrecy holds: it is
+# not derived from any key the sender holds). The file payload uses exactly the
+# same chunked/AAD scheme as the Ed25519 container: per-chunk nonces, a
+# final-chunk flag, and the header as associated data, so tampering with the
+# header or truncating/extending the payload fails the authentication tag.
+# A fresh session key is wrapped each time, so RSA-OAEP adds no per-chunk cost.
+# ---------------------------------------------------------------------------
+
+from cryptography.hazmat.primitives.asymmetric import padding as _rsa_padding
+
+
+def _aead_is_aes(cipher):
+    return cipher == _CIPHER_AES
+
+
+def _aead_encrypt(is_aes, key, base_nonce, index, header, final, chunk):
+    nonce = _chunk_nonce(base_nonce, index)
+    aad = header + (_FLAG_FINAL if final else _FLAG_MORE)
+    if is_aes:
+        return AESGCM(key).encrypt(nonce, chunk, aad)
+    return _xchacha20_encrypt(nonce, chunk, aad, key)
+
+
+def _aead_decrypt(is_aes, key, base_nonce, index, header, final, ct):
+    nonce = _chunk_nonce(base_nonce, index)
+    aad = header + (_FLAG_FINAL if final else _FLAG_MORE)
+    if is_aes:
+        return AESGCM(key).decrypt(nonce, ct, aad)
+    return _xchacha20_decrypt(nonce, ct, aad, key)
+
+
+def _rsa_modulus_bytes(rsa_pub) -> int:
+    return (rsa_pub.key_size + 7) // 8
+
+
+class RSAEncryptor:
+    """Stateful, per-chunk RSA encryptor.
+
+    Write ``.header`` first, then pass each plaintext chunk to
+    :meth:`encrypt_chunk`, concatenating the results after the header. Every
+    chunk but the last must be exactly ``chunk_len`` bytes; the last (possibly
+    empty) must be passed with ``final=True``.
+    """
+
+    def __init__(self, rsa_public, cipher: int = _CIPHER_AES,
+                 chunk_len: int = DEFAULT_CHUNK_LEN,
+                 payload_type: int = PAYLOAD_FILE):
+        if payload_type not in _PAYLOAD_TYPES:
+            raise ValueError(f"unsupported payload type: {payload_type:#x}")
+        if not 0 < chunk_len <= _MAX_CHUNK_LEN:
+            raise ValueError("chunk_len must be between 1 and 16 MiB")
+        nonce_len = _nonce_len_for(cipher)
+
+        self.cipher = cipher
+        self.payload_type = payload_type
+        self.chunk_len = chunk_len
+        self._is_aes = (cipher == _CIPHER_AES)
+        self._index = 0
+        self._closed = False
+
+        # A fresh random 32-byte AES session key, wrapped in the RSA public key
+        # with RSA-OAEP + SHA-256. Only the matching RSA private key can unwrap
+        # it. OAEP plaintext limit for 2048-bit RSA is 190 bytes; 4096-bit is
+        # 446 bytes - a 32-byte key always fits.
+        session_key = os.urandom(32)
+        wrapped = rsa_public.encrypt(
+            session_key,
+            _rsa_padding.OAEP(_rsa_padding.MGF1(hashes.SHA256()),
+                              hashes.SHA256(), None))
+
+        self._key = session_key
+        self._base_nonce = os.urandom(nonce_len)
+        self.header = (
+            _MAGIC_RSA
+            + bytes([cipher, payload_type, _RSA_ALG_OAEP_SHA256])
+            + wrapped
+            + self._base_nonce
+            + chunk_len.to_bytes(_CHUNK_LEN_BYTES, "big")
+        )
+
+    def encrypt_chunk(self, chunk: bytes, final: bool = False) -> bytes:
+        if self._closed:
+            raise ValueError("Encryptor already closed")
+        if final:
+            if len(chunk) > self.chunk_len:
+                raise ValueError(
+                    f"chunk exceeds chunk_len ({len(chunk)} > {self.chunk_len})")
+        elif len(chunk) != self.chunk_len:
+            raise ValueError("only the final chunk may be shorter than chunk_len")
+        if self._index >= _MAX_CHUNKS:
+            raise ValueError("too many chunks for this chunk_len")
+        out = _aead_encrypt(self._is_aes, self._key, self._base_nonce, self._index,
+                            self.header, final, chunk)
+        self._index += 1
+        if final:
+            self.close()
+        return out
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._key = b"\x00" * 32
+
+    def __enter__(self) -> "RSAEncryptor":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+class RSADecryptor:
+    """Stateful, per-chunk RSA decryptor.
+
+    Construct with the full header (magic..chunk_len). Then pass each
+    ciphertext block to :meth:`decrypt_chunk`: every block but the last is
+    exactly ``block_size`` bytes, and the last must be passed with
+    ``final=True``. Call :meth:`close` when done.
+    """
+
+    def __init__(self, header: bytes, rsa_private):
+        #   magic | cipher | payload | alg | wrapped | base_nonce | chunk_len
+        scheme, cipher, payload_type = _parse_prefix(header)
+        if scheme != "rsa":
+            raise ValueError(
+                "this container is Ed25519-encrypted; use the corresponding "
+                "Ed25519 private key (not an RSA key)")
+        nonce_len = _nonce_len_for(cipher)
+        mod_bytes = _rsa_modulus_bytes(rsa_private.public_key())
+        # alg(1)
+        if len(header) < _PREFIX_BYTES + _RSA_ALG_BYTES:
+            raise ValueError("encrypted payload too short or corrupt")
+        alg = header[_PREFIX_BYTES]
+        if alg != _RSA_ALG_OAEP_SHA256:
+            raise ValueError(f"unsupported RSA algorithm: {alg:#x}")
+        off = _PREFIX_BYTES + _RSA_ALG_BYTES
+        wrapped = header[off:off + mod_bytes]; off += mod_bytes
+        base_nonce = header[off:off + nonce_len]; off += nonce_len
+        if off + _CHUNK_LEN_BYTES != len(header):
+            raise ValueError("encrypted payload too short or corrupt")
+        chunk_len = int.from_bytes(header[off:off + _CHUNK_LEN_BYTES], "big")
+        if chunk_len <= 0:
+            raise ValueError("invalid chunk size in header")
+        if chunk_len > _MAX_CHUNK_LEN:
+            raise ValueError("chunk size in header too large (limit 16 MiB)")
+
+        self.cipher = cipher
+        self.payload_type = payload_type
+        self._is_aes = (cipher == _CIPHER_AES)
+        self.chunk_len = chunk_len
+        self.block_size = chunk_len + _TAG_BYTES
+        self._header = bytes(header)
+        self._base_nonce = base_nonce
+        self._index = 0
+        self._closed = False
+
+        try:
+            self._key = rsa_private.decrypt(
+                wrapped,
+                _rsa_padding.OAEP(_rsa_padding.MGF1(hashes.SHA256()),
+                                  hashes.SHA256(), None))
+        except Exception:
+            # Wrong private key, or the wrapped key is garbage.
+            self._key = b"\x00" * 32
+            raise ValueError(DECRYPT_FAILED)
+
+    def decrypt_chunk(self, ct_chunk: bytes, final: bool = False) -> bytes:
+        if self._closed:
+            raise ValueError("Decryptor already closed")
+        if final:
+            if not _TAG_BYTES <= len(ct_chunk) <= self.block_size:
+                raise ValueError("encrypted payload truncated or corrupt")
+        elif len(ct_chunk) != self.block_size:
+            raise ValueError("encrypted payload truncated or corrupt")
+        if self._index >= _MAX_CHUNKS:
+            raise ValueError("encrypted payload has too many chunks")
+        out = _aead_decrypt(self._is_aes, self._key, self._base_nonce, self._index,
+                            self._header, final, ct_chunk)
+        self._index += 1
+        if final:
+            self.close()
+        return out
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._key = b"\x00" * 32
+
+    def __enter__(self) -> "RSADecryptor":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def encrypt_stream_rsa(plaintext_iter, rsa_public, cipher: int = _CIPHER_AES,
+                       chunk_len: int = DEFAULT_CHUNK_LEN,
+                       payload_type: int = PAYLOAD_FILE):
+    """Stream-encrypt to an RSA public key: yield the RSA header, then the
+    ciphertext chunks. The 32-byte session key is wrapped once in the header."""
+    enc = RSAEncryptor(rsa_public, cipher, chunk_len, payload_type)
+    out: list[bytes] = []
+    writer = _RSAStreamWriter(enc, out.append)
+    try:
+        for piece in _pieces(plaintext_iter, chunk_len):
+            writer.write(piece)
+            yield from out
+            out.clear()
+        writer.close()
+        yield from out
+    finally:
+        writer.abort()
+
+
+class _RSAStreamWriter:
+    """Push-style helper mirroring StreamEncryptor: buffers until EOF so only
+    the final chunk is sealed as final."""
+
+    def __init__(self, enc: RSAEncryptor, sink):
+        self._enc = enc
+        self._sink = sink
+        self._chunk_len = enc.chunk_len
+        self._pending = bytearray()
+        self._sink(enc.header)
+
+    def write(self, data) -> int:
+        cl = self._chunk_len
+        self._pending += data
+        n = max(0, (len(self._pending) - 1) // cl)
+        for i in range(n):
+            self._sink(self._enc.encrypt_chunk(bytes(self._pending[i * cl:(i + 1) * cl])))
+        del self._pending[:n * cl]
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        if not self._enc._closed:
+            self._sink(self._enc.encrypt_chunk(bytes(self._pending), final=True))
+            self._pending.clear()
+
+    def abort(self) -> None:
+        self._enc.close()
+        self._pending.clear()
+
+
+class RSAStreamEncryptor:
+    """Push-style streaming encryptor for RSA: :meth:`write` plaintext in
+    pieces of any size and the container (RSA header, then ciphertext chunks)
+    is passed to ``sink`` as it is produced. :meth:`close` emits the final
+    chunk. File-like, so :class:`zipfile.ZipFile` can write straight into it.
+    """
+
+    def __init__(self, sink, rsa_public, cipher: int = _CIPHER_AES,
+                 chunk_len: int = DEFAULT_CHUNK_LEN,
+                 payload_type: int = PAYLOAD_FILE):
+        enc = RSAEncryptor(rsa_public, cipher, chunk_len, payload_type)
+        self._w = _RSAStreamWriter(enc, sink)
+
+    def write(self, data) -> int:
+        return self._w.write(data)
+
+    def flush(self) -> None:
+        self._w.flush()
+
+    def close(self) -> None:
+        self._w.close()
+
+    def abort(self) -> None:
+        self._w.abort()
+
+
+def decrypt_stream_rsa(container_iter, rsa_private, salvage: bool = False):
+    """Stream-decrypt an RSA container with the RSA private key. The wrapped
+    session key's length is the RSA modulus size, which the private key knows,
+    so no extra argument is needed."""
+
+    modulus_bytes = _rsa_modulus_bytes(rsa_private.public_key())
+
+    def make(header: bytes) -> RSADecryptor:
+        return RSADecryptor(header, rsa_private)
+
+    def size(prefix: bytes) -> int:
+        _, cipher, _ = _parse_prefix(prefix)
+        nonce_len = _nonce_len_for(cipher)
+        return (_PREFIX_BYTES + _RSA_ALG_BYTES + modulus_bytes + nonce_len
+                + _CHUNK_LEN_BYTES)
+
+    yield from _decrypt_stream(container_iter, make, size, salvage)
+
+
+def encrypt_bytes_rsa(plaintext: bytes, rsa_public, cipher: int = _CIPHER_AES,
+                      chunk_len: int = DEFAULT_CHUNK_LEN,
+                      payload_type: int = PAYLOAD_FILE) -> bytes:
+    return b"".join(encrypt_stream_rsa([plaintext], rsa_public, cipher,
+                                       chunk_len, payload_type))
+
+
+def decrypt_bytes_rsa(container: bytes, rsa_private) -> bytes:
+    return b"".join(decrypt_stream_rsa([container], rsa_private))

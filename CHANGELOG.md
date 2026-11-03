@@ -5,6 +5,24 @@ All notable changes to PKCrypt are documented here. This project follows
 
 ## [Unreleased]
 
+### Added
+
+- **RSA SSH recipient keys** in Python and C++, alongside Ed25519. Supports
+  OpenSSH RSA keys of at least 2048 bits, including RSA-4096, for files and
+  folders. Encryption needs only the recipient's public key.
+- **RSA container format** (`PKCRYPT\x03`): RSA-OAEP with SHA-256 and
+  MGF1-SHA-256 wraps a fresh 32-byte session key; the payload uses chunked
+  AES-256-GCM or XChaCha20-Poly1305 with an authenticated header.
+- **Passphrase-protected RSA private keys** via `decrypt --passphrase` in both
+  implementations. C++ RSA encryption/decryption requires OpenSSL 3 libcrypto;
+  Ed25519 remains available without OpenSSL.
+- **RSA verification:** Python tests in `tests/test_rsa.py` cover key loading,
+  round trips, both payload ciphers, wrong-key rejection, tamper detection,
+  files and folders. A separate end-to-end test with a freshly generated,
+  passphrase-protected RSA-4096 key verified C++ → Python, C++ → C++, and
+  Python → C++ decryption of a 2.56 MB binary payload, with byte-identical
+  results and no passphrase echo at the C++ terminal prompt.
+
 ## [2.1.0] - 2026-10-30
 
 ### Added

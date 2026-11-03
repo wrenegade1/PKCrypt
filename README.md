@@ -2,7 +2,7 @@
 
 **Author:** Warren Zajac
 
-Encrypt a file so that **only the holder of a specific Ed25519 SSH private key** can
+Encrypt a file so that **only the holder of a specific Ed25519 or RSA SSH private key** can
 decrypt it — using the same public / private key model as SSH.
 
 [![CI](https://github.com/wrenegade1/PKCrypt/actions/workflows/ci.yml/badge.svg)](https://github.com/wrenegade1/PKCrypt/actions/workflows/ci.yml)
@@ -39,6 +39,7 @@ decrypt it — using the same public / private key model as SSH.
   - [Output paths](#output-paths)
   - [Key requirements](#key-requirements)
 - [How it works: the crypto](#how-it-works-the-crypto)
+  - [RSA recipient keys](#rsa-recipient-keys)
   - [Ed25519 → X25519 key conversion](#ed25519--x25519-key-conversion)
   - [Hybrid encryption](#hybrid-encryption)
   - [Key derivation (HKDF)](#key-derivation-hkdf)
@@ -62,21 +63,24 @@ decrypt it — using the same public / private key model as SSH.
 
 - **Two interchangeable implementations** — a Python package and a compiled C++
   binary — that produce the **same file format** and can decrypt each other's output.
-- **Reuses your existing SSH keys.** No new key management, no shared passwords.
+- **Reuses your existing SSH keys.** Supports Ed25519 and RSA (2048 bits or more),
+  including passphrase-protected private keys.
 - **Whole folders, compressed.** Encrypt a folder and it is packed into a standard
   ZIP archive (with in-house DEFLATE compression) inside one `.pkcrypt` file, and
   recreated as a folder on decryption. File names are encrypted too.
 - **Sender never holds a secret.** Encryption needs only the recipient's public key,
   so you can encrypt from anywhere and never receive private material.
-- **Forward secrecy.** A fresh ephemeral key is used per file; even the sender can't
-  decrypt after the fact.
+- **Fresh encryption keys per file.** Ed25519 uses ephemeral X25519 key exchange;
+  RSA wraps a fresh random session key with RSA-OAEP. Compromise of the
+  recipient's private key can expose previously encrypted files.
 - **Any size, flat memory.** Both implementations stream: files and folders are
   read, compressed, encrypted and written a chunk at a time, so a multi-gigabyte
   input uses a few MiB of memory.
 - **Authenticated encryption.** Tampered files and wrong keys are detected and
   rejected — never partially decrypted.
 - **No crypto invented here.** Built entirely on libsodium and `cryptography`, the
-  reference implementations of X25519, HKDF-SHA256, and AES-256-GCM.
+  implementations of X25519, HKDF-SHA256, RSA-OAEP, and authenticated encryption
+  (C++ RSA uses OpenSSL libcrypto).
 
 ---
 
@@ -114,7 +118,22 @@ pkcrypt decrypt ~/.ssh/id_ed25519 report.pdf.pkcrypt
 # -> report.pdf
 ```
 
-That's it. Same keys you use for SSH, no new infrastructure.
+For a passphrase-protected RSA-4096 key, use the same commands with RSA paths:
+
+```bash
+# Recipient: generate a key; enter a non-empty passphrase when prompted
+ssh-keygen -t rsa -b 4096 -f ~/.ssh/pkcrypt_rsa
+
+# Sender: encrypt using only the recipient's public key
+pkcrypt encrypt recipient_rsa.pub report.pdf
+
+# Recipient: unlock the private key at the terminal and decrypt
+pkcrypt decrypt --passphrase ~/.ssh/pkcrypt_rsa report.pdf.pkcrypt
+```
+
+Share `pkcrypt_rsa.pub` with the sender as `recipient_rsa.pub`. The Python
+CLI accepts the same arguments via `python3 -m pkcrypt_lib`. Install `bcrypt`
+alongside `cryptography` to load passphrase-protected OpenSSH keys in Python.
 
 ---
 
@@ -132,7 +151,7 @@ Requires **Python 3.9+**.
 brew install libsodium
 
 # Python dependency: cryptography (X25519, HKDF, AES-GCM)
-pip install cryptography
+pip install cryptography bcrypt
 
 # Install the package (creates the `pkcrypt` command)
 cd PKCrypt
@@ -144,10 +163,13 @@ python3 -m pkcrypt_lib --help
 
 ### C++ implementation (compiled)
 
-Requires a **C++17** compiler and **libsodium**.
+Requires a **C++17** compiler and **libsodium**. RSA additionally requires
+**OpenSSL 3 libcrypto**. The Makefile detects OpenSSL through `pkg-config`;
+CMake uses `find_package(OpenSSL)`. Without OpenSSL, Ed25519 still works and
+RSA operations report that the build lacks OpenSSL.
 
 ```bash
-brew install libsodium
+brew install libsodium openssl@3 pkg-config
 
 cd PKCrypt
 make          # builds ./pkcrypt
@@ -321,8 +343,10 @@ pkcrypt decrypt --salvage ~/.ssh/id_ed25519 photos.pkcrypt
 
 ### Key requirements
 
-- The recipient's key must be an **Ed25519** SSH key (the modern
-  `ssh-keygen -t ed25519`). RSA, ECDSA, Ed448, etc. are rejected with a clear message.
+- The recipient must use an OpenSSH **Ed25519** or **RSA** key. RSA keys must
+  be at least **2048 bits**; RSA-4096 is supported. ECDSA and Ed448 are unsupported.
+- C++ RSA operations require **OpenSSL 3**; the bundled AES fallback supports
+  Ed25519 key unlocking but does not provide RSA encryption/decryption.
 - **Python** supports passphrase-protected private keys via `decrypt --passphrase`.
 - **C++** also supports passphrase-protected private keys via `decrypt --passphrase`
   (it unlocks the key with the passphrase, using an in-house `bcrypt_pbkdf` and
@@ -336,6 +360,14 @@ pkcrypt decrypt --salvage ~/.ssh/id_ed25519 photos.pkcrypt
 
 PKCrypt uses **hybrid public-key encryption** — a standard, battle-tested scheme
 (a blend of the constructions used by age, minisign, and OpenSSH itself).
+
+### RSA recipient keys
+
+RSA uses a fresh random 32-byte session key per container. The recipient's
+public key wraps it using **RSA-OAEP with SHA-256 and MGF1-SHA-256** (empty
+label). The private key unwraps it during decryption. The session key encrypts
+the payload with AES-256-GCM or XChaCha20-Poly1305, using the same chunk and
+final-chunk authentication rules as Ed25519. RSA does not use X25519 or HKDF.
 
 ### Ed25519 → X25519 key conversion
 
@@ -391,7 +423,25 @@ Binding the two public keys into `info` guarantees a distinct key for every
 ## File format specification
 
 The `.pkcrypt` file is a single self-contained container. The recipient needs nothing
-but their private key to open it.
+but their private key (and its passphrase, if protected) to open it.
+
+Ed25519 uses format version 2 (`PKCRYPT\x02`), detailed below. RSA uses
+format version 3 (`PKCRYPT\x03`) with this header, in order:
+
+| RSA header field | Size | Description |
+|------------------|------|-------------|
+| `magic` | 8 B | `PKCRYPT` followed by `0x03`. |
+| `cipher`, `payload` | 1 B each | Same values as version 2. |
+| `algorithm` | 1 B | `0x00` = RSA-OAEP with SHA-256 and MGF1-SHA-256. |
+| `wrapped session key` | RSA modulus size in bytes | 256 B for RSA-2048; 512 B for RSA-4096. |
+| `base nonce` | 12 or 24 B | Selected by the payload cipher. |
+| `chunk_len` | 4 B | Big-endian maximum plaintext chunk size. |
+
+The wrapped-key length is inferred from the recipient's RSA key. The complete
+RSA header is authenticated as AAD for each chunk, followed by the same
+final-chunk flag used in version 2.
+
+### Ed25519 container (version 2)
 
 ```
  Format version 2
@@ -574,6 +624,7 @@ All suites generate throwaway keys in a temp directory and never touch your real
 
 ## Troubleshooting
 
+
 ### `error: decryption failed: file is not for this private key, or it was tampered with or truncated`
 You are using the **wrong private key**, or the `.pkcrypt` file was **modified** or
 **cut short** since creation (e.g. an interrupted transfer), or it was corrupted in transit.
@@ -593,11 +644,11 @@ Nothing was written.
 The destination folder already exists (even if empty). Remove or rename it, or pass a
 different output path as the third argument.
 
-### `error: unsupported key type 'ssh-rsa' (expected ssh-ed25519)`
-PKCrypt only accepts **Ed25519** keys. Generate one with:
-```bash
-ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
-```
+### RSA key rejected or build lacks OpenSSL
+RSA requires the updated Python package or a C++ binary built with OpenSSL 3.
+If an older binary reports that only Ed25519 is accepted, rebuild the current
+sources. For C++, install `openssl@3` and `pkg-config` before rebuilding.
+RSA keys smaller than 2048 bits are rejected.
 
 ### I have a passphrase-protected private key
 Both implementations accept one via `decrypt --passphrase`, which prompts for the
@@ -610,7 +661,9 @@ python3 -m pkcrypt_lib decrypt --passphrase ~/.ssh/id_ed25519 secret.pkcrypt
 
 The C++ binary unlocks the key with an in-house `bcrypt_pbkdf` and AES-CTR
 (using OpenSSL's AES when available, and a bundled fallback otherwise), so it
-works on systems without OpenSSL. Do **not** empty your key's passphrase (for
+supports Ed25519 on systems without OpenSSL. RSA operations still require
+OpenSSL 3. Use `~/.ssh/id_rsa` in the commands above for an RSA key. Do **not**
+empty your key's passphrase (for
 example with `ssh-keygen -p -f ~/.ssh/id_ed25519 -N ""` just to use a tool) —
 that weakens your SSH key.
 

@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <functional>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -137,6 +139,28 @@ bool has_usable_name(std::string path) {
     return !name.empty() && name != "." && name != "..";
 }
 
+// The first whitespace-delimited token of a file (OpenSSH key type, e.g.
+// "ssh-ed25519" or "ssh-rsa"); "" if the file can't be read.
+std::string first_token(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return "";
+    std::string tok;
+    f >> tok;
+    return tok;
+}
+
+// Container scheme implied by a file's 8-byte magic: "ed25519", "rsa", or "".
+std::string container_kind_of(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return "";
+    char magic[8] = {0};
+    f.read(magic, 8);
+    if (f.gcount() < 8) return "";
+    if (std::memcmp(magic, "PKCRYPT\x02", 8) == 0) return "ed25519";
+    if (std::memcmp(magic, "PKCRYPT\x03", 8) == 0) return "rsa";
+    return "";
+}
+
 int cmd_encrypt(const std::vector<std::string>& args) {
     if (args.size() < 2) {
         std::cerr << "usage: pkcrypt encrypt <recipient_pubkey> <file|folder> [out.pkcrypt]\n";
@@ -151,26 +175,35 @@ int cmd_encrypt(const std::vector<std::string>& args) {
     }
     std::string out_path = args.size() >= 3 ? args[2] : encrypted_output_path(in_path);
 
+    // Sniff the recipient key type from the first whitespace token.
+    std::string type = first_token(pub_path);
+    const bool rsa = (type == "ssh-rsa");
+
     std::string error;
-    auto key = parse_ssh_public_key_file(pub_path, error);
-    if (!key) {
-        std::cerr << "error: " << display_safe(error) << "\n";
-        return RC_USAGE;
+    AtomicFile out;
+    ArchiveStats stats;
+    bool ok = out.open(out_path, error);
+
+    if (rsa) {
+        auto key = parse_ssh_rsa_public_key_file(pub_path, error);
+        if (!key) { std::cerr << "error: " << display_safe(error) << "\n"; return RC_USAGE; }
+        RSAStreamEncryptor enc;
+        ok = ok && enc.begin(out, key->n.data(), key->n.size(), key->e.data(), key->e.size(),
+                             key->modulus_bytes(), is_dir ? PAYLOAD_ARCHIVE : PAYLOAD_FILE,
+                             error);
+        if (ok && is_dir) ok = pack_directory(in_path, enc, stats, error);
+        else if (ok) ok = stream_file(in_path, enc, error);
+        ok = ok && enc.finish(error) && out.commit(error);
+    } else {
+        auto key = parse_ssh_public_key_file(pub_path, error);
+        if (!key) { std::cerr << "error: " << display_safe(error) << "\n"; return RC_USAGE; }
+        StreamEncryptor enc;
+        ok = ok && enc.begin(out, key->public_key, is_dir ? PAYLOAD_ARCHIVE : PAYLOAD_FILE, error);
+        if (ok && is_dir) ok = pack_directory(in_path, enc, stats, error);
+        else if (ok) ok = stream_file(in_path, enc, error);
+        ok = ok && enc.finish(error) && out.commit(error);
     }
 
-    // Everything streams: input -> (ZIP + DEFLATE for a folder) -> encryption
-    // -> temp output file, which is published only once complete.
-    AtomicFile out;
-    StreamEncryptor enc;
-    ArchiveStats stats;
-    bool ok = out.open(out_path, error) &&
-              enc.begin(out, key->public_key, is_dir ? PAYLOAD_ARCHIVE : PAYLOAD_FILE, error);
-    if (ok && is_dir) {
-        ok = pack_directory(in_path, enc, stats, error);
-    } else if (ok) {
-        ok = stream_file(in_path, enc, error);
-    }
-    ok = ok && enc.finish(error) && out.commit(error);
     if (!ok) {
         std::cerr << "error: " << display_safe(error) << "\n";
         return RC_FAILURE;
@@ -223,12 +256,8 @@ int cmd_decrypt(std::vector<std::string> args) {
         pass_buf = p;
         passphrase = pass_buf.c_str();
     }
-    auto key = parse_ssh_private_key_file(priv_path, error, passphrase);
-    if (!key) {
-        std::cerr << "error: " << display_safe(error) << "\n";
-        return RC_USAGE;
-    }
-    if (!pass_buf.empty()) sodium_memzero(pass_buf.data(), pass_buf.size());
+    // Route by container kind (Ed25519 vs RSA).
+    std::string kind = container_kind_of(in_path);          // ed25519 | rsa | ""
 
     int in_fd = ::open(in_path.c_str(), O_RDONLY | O_CLOEXEC);
     if (in_fd < 0) {
@@ -236,12 +265,47 @@ int cmd_decrypt(std::vector<std::string> args) {
         return RC_FAILURE;
     }
     FdSource in(in_fd);
-    StreamDecryptor dec;
-    if (!dec.begin(in, key->private_key, key->public_key, error)) {
+
+    std::function<unsigned char()> payload_of;
+    std::function<bool(ByteSink&, std::string&, bool)> run_of;
+    RSAStreamDecryptor rdec;
+    StreamDecryptor edec;
+    if (kind == "rsa") {
+        auto rkey = parse_ssh_rsa_private_key_file(priv_path, error, passphrase);
+        if (!rkey) {
+            std::cerr << "error: " << display_safe(error) << "\n";
+            ::close(in_fd);
+            return RC_USAGE;
+        }
+        if (!rdec.begin(in, rkey->n.data(), rkey->n.size(), rkey->e.data(), rkey->e.size(),
+                        rkey->d.data(), rkey->d.size(), rkey->p.data(), rkey->p.size(),
+                        rkey->q.data(), rkey->q.size(), error)) {
+            std::cerr << "error: " << display_safe(error) << "\n";
+            ::close(in_fd);
+            return RC_FAILURE;
+        }
+        payload_of = [&] { return rdec.payload_type(); };
+        run_of = [&](ByteSink& o, std::string& e, bool s) { return rdec.run(o, e, s); };
+    } else if (kind == "ed25519") {
+        auto edkey = parse_ssh_private_key_file(priv_path, error, passphrase);
+        if (!edkey) {
+            std::cerr << "error: " << display_safe(error) << "\n";
+            ::close(in_fd);
+            return RC_USAGE;
+        }
+        if (!edec.begin(in, edkey->private_key, edkey->public_key, error)) {
+            std::cerr << "error: " << display_safe(error) << "\n";
+            ::close(in_fd);
+            return RC_FAILURE;
+        }
+        payload_of = [&] { return edec.payload_type(); };
+        run_of = [&](ByteSink& o, std::string& e, bool s) { return edec.run(o, e, s); };
+    } else {
+        std::cerr << "error: not a PKCrypt file (bad header)\n";
         ::close(in_fd);
-        std::cerr << "error: " << display_safe(error) << "\n";
         return RC_FAILURE;
     }
+    if (!pass_buf.empty()) sodium_memzero(pass_buf.data(), pass_buf.size());
 
     // Plaintext streams to a temporary file and is only published (linked
     // into place, or extracted) once every chunk has verified - or, with
@@ -250,7 +314,7 @@ int cmd_decrypt(std::vector<std::string> args) {
     bool partial = false;
     std::string decrypt_error;
     ArchiveStats stats;
-    if (dec.payload_type() == PAYLOAD_ARCHIVE) {
+    if (payload_of() == PAYLOAD_ARCHIVE) {
         // ZIP needs random access (its index is at the end), so the archive
         // goes to a private 0600 scratch file beside the destination, removed
         // when `scratch` goes out of scope.
@@ -259,7 +323,7 @@ int cmd_decrypt(std::vector<std::string> args) {
         ok = ::lstat(out_path.c_str(), &st) != 0;
         if (!ok) error = "refusing to overwrite existing path: " + out_path;
         ok = ok && scratch.create(parent_dir(out_path), error);
-        const bool verified = ok && dec.run(scratch, decrypt_error, salvage);
+        const bool verified = ok && run_of(scratch, decrypt_error, salvage);
         if (ok && !salvage) {
             ok = verified;
             if (!ok) error = decrypt_error;
@@ -285,7 +349,7 @@ int cmd_decrypt(std::vector<std::string> args) {
     } else {
         AtomicFile out;
         ok = out.open(out_path, error);
-        if (ok && !dec.run(out, decrypt_error, salvage)) {
+        if (ok && !run_of(out, decrypt_error, salvage)) {
             if (salvage && out.size() > 0) {
                 partial = true;             // keep the verified start of the file
                 out.set_destination(partial_path);

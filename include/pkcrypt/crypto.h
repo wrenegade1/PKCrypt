@@ -171,6 +171,109 @@ private:
     std::vector<unsigned char> plain_;      // plaintext scratch
 };
 
+// ---------------------------------------------------------------------------
+// RSA recipient-key container (interoperable with the Python pkcrypt_lib).
+//
+//   header:
+//     magic       8 bytes   "PKCRYPT\x03"
+//     cipher      1 byte    0x00 = AES-256-GCM | 0x01 = XChaCha20-Poly1305
+//     payload     1 byte    0x00 = single file | 0x01 = ZIP archive (a folder)
+//     alg         1 byte    0x00 = rsa-oaep-sha256
+//     wrapped_key N bytes   RSA-OAEP(SHA-256) of a random 32-byte session key
+//                           (N = the RSA modulus size: 256 for 2048-bit, 512
+//                           for 4096-bit)
+//     base_nonce  12|24 B   AEAD base nonce
+//     chunk_len   4 bytes   max plaintext bytes per chunk, big-endian
+//   payload:
+//     chunks     each AEAD ciphertext = (chunk bytes + 16-byte auth tag)
+//
+// The file payload uses the same chunked/AAD scheme as the Ed25519 container
+// (per-chunk nonces, final-chunk flag, header as AAD), with the AEAD key being
+// the fresh 32-byte session key. Encrypting needs only the recipient's RSA
+// *public* key; only the matching RSA *private* key can unwrap the session key
+// and decrypt. C++ requires OpenSSL's libcrypto; without it RSA is unsupported
+// (Ed25519 still works via libsodium).
+// ---------------------------------------------------------------------------
+
+constexpr char PKCRYPT_MAGIC_RSA[8]  = { 'P','K','C','R','Y','P','T', 0x03 };
+constexpr size_t RSA_ALG_BYTES       = 1;
+constexpr unsigned char RSA_ALG_OAEP_SHA256 = 0x00;
+
+// Streaming RSA encryption (mirrors StreamEncryptor's chunk behaviour).
+class RSAStreamEncryptor : public ByteSink {
+public:
+    RSAStreamEncryptor() = default;
+    RSAStreamEncryptor(const RSAStreamEncryptor&) = delete;
+    RSAStreamEncryptor& operator=(const RSAStreamEncryptor&) = delete;
+    ~RSAStreamEncryptor() override;
+
+    // `rsa_n`/`rsa_e` are the recipient's RSA modulus and exponent (public key).
+    // `modulus_bytes` == the byte length of `rsa_n`. Wraps a fresh session key
+    // via RSA-OAEP and writes the header to `out`.
+    bool begin(ByteSink& out, const unsigned char* rsa_n, size_t n_len,
+               const unsigned char* rsa_e, size_t e_len, size_t modulus_bytes,
+               unsigned char payload_type, std::string& error,
+               unsigned char cipher = CIPHER_AES, size_t chunk_len = DEFAULT_CHUNK_LEN);
+    bool write(const unsigned char* data, size_t n, std::string& error) override;
+    bool finish(std::string& error);
+
+private:
+    bool seal(bool final, std::string& error);
+    void wipe();
+
+    ByteSink* out_ = nullptr;
+    bool active_ = false;
+    bool is_aes_ = true;
+    std::vector<unsigned char> wrapped_key_;
+    unsigned char key_[KEY_BYTES] = {0};
+    unsigned char base_nonce_[NONCE_BYTES_XC] = {0};
+    size_t nonce_len_ = 0;
+    size_t chunk_len_ = 0;
+    uint64_t index_ = 0;
+    std::vector<unsigned char> aad_;        // header || final flag
+    std::vector<unsigned char> pending_;    // plaintext not yet sealed
+    std::vector<unsigned char> sealed_;     // ciphertext scratch
+};
+
+// Streaming RSA decryption. begin() reads the header and unwraps the session
+// key with the RSA private key; run() decrypts every chunk into `out`. Callers
+// must publish `out` only after run() returns true (see StreamDecryptor).
+class RSAStreamDecryptor {
+public:
+    RSAStreamDecryptor() = default;
+    RSAStreamDecryptor(const RSAStreamDecryptor&) = delete;
+    RSAStreamDecryptor& operator=(const RSAStreamDecryptor&) = delete;
+    ~RSAStreamDecryptor();
+
+    bool begin(ByteSource& in,
+               const unsigned char* rsa_n, size_t n_len,
+               const unsigned char* rsa_e, size_t e_len,
+               const unsigned char* rsa_d, size_t d_len,
+               const unsigned char* rsa_p, size_t p_len,
+               const unsigned char* rsa_q, size_t q_len,
+               std::string& error);
+
+    unsigned char payload_type() const { return payload_type_; }
+
+    bool run(ByteSink& out, std::string& error, bool salvage = false);
+
+private:
+    bool open(const std::vector<unsigned char>& ct, bool final, ByteSink& out,
+              std::string& error);
+    void wipe();
+
+    ByteSource* in_ = nullptr;
+    bool is_aes_ = true;
+    unsigned char payload_type_ = PAYLOAD_FILE;
+    unsigned char key_[KEY_BYTES] = {0};
+    unsigned char base_nonce_[NONCE_BYTES_XC] = {0};
+    size_t nonce_len_ = 0;
+    size_t chunk_len_ = 0;
+    uint64_t index_ = 0;
+    std::vector<unsigned char> aad_;        // header || final flag
+    std::vector<unsigned char> plain_;      // plaintext scratch
+};
+
 } // namespace pkcrypt
 
 #endif // PKCRYPT_CRYPTO_H

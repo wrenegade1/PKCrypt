@@ -67,6 +67,15 @@ public:
         return true;
     }
 
+    // Reads an OpenSSH "mpint" (length-prefixed signed big-endian integer),
+    // returning the raw bytes (sign byte, if any, included).
+    bool read_mpint(std::vector<unsigned char>& out) {
+        return read_string(out);
+    }
+
+    // Remaining bytes (used to sanity-check trailing data).
+    bool has_left(size_t n = 1) const { return pos_ + n <= data_.size(); }
+
 private:
     std::vector<unsigned char> data_;
     size_t pos_ = 0;
@@ -338,6 +347,147 @@ std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
 
     // Wipe the raw seed/key material from temporary buffers before returning.
     sodium_memzero(priv_raw.data(), priv_raw.size());
+    if (!priv_plain.empty()) sodium_memzero(priv_plain.data(), priv_plain.size());
+    sodium_memzero(raw.data(), raw.size());
+    return key;
+}
+
+// ---------------------------------------------------------------------------
+// RSA keys
+// ---------------------------------------------------------------------------
+
+// Strip the mpint sign byte (a leading 0x00 OpenSSH prepends when the most
+// significant bit is set, which is always true of an RSA modulus).
+void strip_sign(std::vector<unsigned char>& v) {
+    size_t i = 0;
+    while (i < v.size() && v[i] == 0) ++i;
+    if (i == 0) return;
+    if (i == v.size()) { v.clear(); return; }
+    v.erase(v.begin(), v.begin() + i);
+}
+
+std::optional<RsaKey> parse_ssh_rsa_public_key_file(const std::string& path,
+                                                    std::string& error) {
+    std::ifstream f(path);
+    if (!f.is_open()) { error = "cannot open public key file: " + path; return std::nullopt; }
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    size_t nl = content.find_first_of("\r\n");
+    std::string line = (nl == std::string::npos) ? content : content.substr(0, nl);
+    std::istringstream iss(line);
+    std::string type, b64;
+    iss >> type >> b64;
+    if (type != "ssh-rsa") {
+        error = "expected an ssh-rsa public key (got '" + type + "')";
+        return std::nullopt;
+    }
+    std::vector<unsigned char> raw;
+    if (!base64_decode(b64, raw) || raw.empty()) {
+        error = "public key base64 data is malformed";
+        return std::nullopt;
+    }
+    Reader r(raw);
+    std::vector<unsigned char> type_str;
+    if (!r.read_string(type_str) || std::string(type_str.begin(), type_str.end()) != "ssh-rsa") {
+        error = "malformed RSA public key (bad type)";
+        return std::nullopt;
+    }
+    RsaKey key;
+    if (!r.read_mpint(key.e) || !r.read_mpint(key.n)) {
+        error = "malformed RSA public key";
+        return std::nullopt;
+    }
+    strip_sign(key.e);
+    strip_sign(key.n);
+    if (key.n.empty() || key.n.size() < 256) {
+        error = "RSA public key too small (need at least 2048 bits)";
+        return std::nullopt;
+    }
+    return key;
+}
+
+std::optional<RsaKey> parse_ssh_rsa_private_key_file(const std::string& path,
+                                                     std::string& error,
+                                                     const char* passphrase) {
+    std::ifstream f(path);
+    if (!f.is_open()) { error = "cannot open private key file: " + path; return std::nullopt; }
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::vector<unsigned char> raw;
+    if (!parse_private_pem(content, raw, error)) return std::nullopt;
+
+    Reader r(raw);
+    unsigned char magic_buf[15];
+    if (!r.read_bytes(magic_buf, 15) || std::memcmp(magic_buf, "openssh-key-v1", 15) != 0) {
+        sodium_memzero(raw.data(), raw.size());
+        error = "unrecognized key header (not openssh-key-v1)";
+        return std::nullopt;
+    }
+    std::vector<unsigned char> cipher, kdf, kdfopts;
+    if (!r.read_string(cipher) || !r.read_string(kdf) || !r.read_string(kdfopts)) {
+        sodium_memzero(raw.data(), raw.size());
+        error = "malformed key header";
+        return std::nullopt;
+    }
+    std::string cipher_name(cipher.begin(), cipher.end());
+    std::string kdf_name(kdf.begin(), kdf.end());
+    uint32_t nkeys;
+    if (!r.read_u32(nkeys) || nkeys != 1) {
+        sodium_memzero(raw.data(), raw.size());
+        error = "expected exactly 1 key in file";
+        return std::nullopt;
+    }
+    std::vector<unsigned char> pub_blob, priv_blob;
+    if (!r.read_string(pub_blob) || !r.read_string(priv_blob)) {
+        sodium_memzero(raw.data(), raw.size());
+        error = "malformed key: key blob";
+        return std::nullopt;
+    }
+    (void)pub_blob;
+
+    std::vector<unsigned char> priv_plain;
+    const unsigned char* priv_data = priv_blob.data();
+    size_t priv_size = priv_blob.size();
+    if (cipher_name != "none" || kdf_name != "none") {
+        if (!decrypt_encrypted_blob(cipher_name, kdf_name, kdfopts, passphrase,
+                                    priv_blob, priv_plain, error)) {
+            sodium_memzero(priv_blob.data(), priv_blob.size());
+            sodium_memzero(raw.data(), raw.size());
+            return std::nullopt;
+        }
+        priv_data = priv_plain.data();
+        priv_size = priv_plain.size();
+        sodium_memzero(priv_blob.data(), priv_blob.size());
+    }
+
+    Reader pr(priv_data, priv_size);
+    uint32_t check1, check2;
+    if (!pr.read_u32(check1) || !pr.read_u32(check2) || check1 != check2) {
+        if (!priv_plain.empty()) sodium_memzero(priv_plain.data(), priv_plain.size());
+        sodium_memzero(raw.data(), raw.size());
+        error = "private key integrity check failed (passphrase encrypted?)";
+        return std::nullopt;
+    }
+    std::vector<unsigned char> keytype;
+    if (!pr.read_string(keytype) || std::string(keytype.begin(), keytype.end()) != "ssh-rsa") {
+        if (!priv_plain.empty()) sodium_memzero(priv_plain.data(), priv_plain.size());
+        sodium_memzero(raw.data(), raw.size());
+        error = "unsupported private key type (expected ssh-rsa)";
+        return std::nullopt;
+    }
+
+    RsaKey key;
+    std::vector<unsigned char> iqmp;
+    if (!pr.read_mpint(key.n) || !pr.read_mpint(key.e) || !pr.read_mpint(key.d) ||
+        !pr.read_mpint(iqmp) || !pr.read_mpint(key.p) || !pr.read_mpint(key.q)) {
+        if (!priv_plain.empty()) sodium_memzero(priv_plain.data(), priv_plain.size());
+        sodium_memzero(raw.data(), raw.size());
+        error = "malformed RSA private key material";
+        return std::nullopt;
+    }
+    strip_sign(key.n); strip_sign(key.e); strip_sign(key.d);
+    strip_sign(key.p); strip_sign(key.q); strip_sign(iqmp);
+    key.has_private = true;
+    sodium_memzero(iqmp.data(), iqmp.size());
+
     if (!priv_plain.empty()) sodium_memzero(priv_plain.data(), priv_plain.size());
     sodium_memzero(raw.data(), raw.size());
     return key;

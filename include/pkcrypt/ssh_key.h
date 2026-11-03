@@ -9,6 +9,7 @@
 
 #include <string>
 #include <optional>
+#include <vector>
 
 namespace pkcrypt {
 
@@ -19,22 +20,42 @@ struct Ed25519Key {
     bool has_private = false;             // true if a private key was parsed
 };
 
-// Parse an OpenSSH public key file ("ssh-ed25519 <b64> <comment>") into raw
-// Ed25519 key material. Only the public portion is populated.
-// Returns the parsed key, or std::nullopt on any parse/format error.
+// RSA key material (mpint byte components, sign byte already stripped).
+struct RsaKey {
+    std::vector<unsigned char> n;   // modulus
+    std::vector<unsigned char> e;   // exponent
+    std::vector<unsigned char> d;   // private exponent (empty if public only)
+    std::vector<unsigned char> p;   // prime p (empty if public only)
+    std::vector<unsigned char> q;   // prime q (empty if public only)
+    bool has_private = false;
+
+    size_t modulus_bytes() const { return n.size(); }
+};
+
+// Parse an OpenSSH public key file ("ssh-ed25519 <b64> <comment>" or
+// "ssh-rsa <b64> <comment>"). Returns the parsed key with an empty `error`, or
+// std::nullopt with `error` set on failure. RSA detection is by type prefix.
 std::optional<Ed25519Key> parse_ssh_public_key_file(const std::string& path,
                                                      std::string& error);
 
-// Parse an OpenSSH private key file ("openssh-key-v1" format, the default
-// produced by `ssh-keygen -t ed25519`) into raw Ed25519 key material. Both
-// public and private portions are populated.
-//
-// The key may be protected by a passphrase (encrypted with aes128/192/256-ctr
-// or chacha20-poly1305 using OpenSSH's bcrypt_pbkdf KDF). If `passphrase` is
-// non-null it is used to decrypt such a key; if it is null and the key is
-// encrypted, the key is rejected with an error. Both public and private
-// portions are populated.
+// Parse an OpenSSH private key file ("openssh-key-v1" format). Returns the
+// parsed key, or std::nullopt with `error` set. For an Ed25519 key both public
+// and private portions are populated. The key may be protected by a passphrase;
+// if `passphrase` is non-null it is used to decrypt such a key, otherwise an
+// encrypted key is rejected with an error.
 std::optional<Ed25519Key> parse_ssh_private_key_file(const std::string& path,
+                                                     std::string& error,
+                                                     const char* passphrase = nullptr);
+
+// Parse an OpenSSH RSA *public* key file ("ssh-rsa <b64> <comment>") into the
+// raw modulus/exponent. Returns the key, or std::nullopt on failure.
+std::optional<RsaKey> parse_ssh_rsa_public_key_file(const std::string& path,
+                                                    std::string& error);
+
+// Parse an OpenSSH RSA *private* key file (the "openssh-key-v1" container with
+// an "ssh-rsa" key). Supports passphrase-protected keys via `passphrase`.
+// Returns the key (n/e/d/p/q populated), or std::nullopt on failure.
+std::optional<RsaKey> parse_ssh_rsa_private_key_file(const std::string& path,
                                                      std::string& error,
                                                      const char* passphrase = nullptr);
 

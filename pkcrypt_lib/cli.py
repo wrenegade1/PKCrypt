@@ -94,7 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def cmd_encrypt(args) -> int:
     recipient_pub = keys.load_public_key(args.recipient_public_key)
-    pub_bytes = recipient_pub.public_bytes_raw()
+    rsa_pub = recipient_pub.key if recipient_pub.type == "rsa" else None
+    pub_bytes = None if rsa_pub else recipient_pub.key.public_bytes_raw()
 
     is_dir = os.path.isdir(args.input_file)
     if is_dir and not args.output_file and not archive.has_usable_name(args.input_file):
@@ -107,8 +108,11 @@ def cmd_encrypt(args) -> int:
     # is zipped straight into the encryptor; no plaintext archive touches disk.
     with files.AtomicOutput(out_path) as out:
         if is_dir:
-            writer = core.StreamEncryptor(out.write, pub_bytes,
-                                          payload_type=core.PAYLOAD_ARCHIVE)
+            writer = (core.RSAStreamEncryptor(out.write, rsa_pub,
+                                              payload_type=core.PAYLOAD_ARCHIVE)
+                      if rsa_pub else
+                      core.StreamEncryptor(out.write, pub_bytes,
+                                           payload_type=core.PAYLOAD_ARCHIVE))
             try:
                 archive.pack_directory(args.input_file, writer, stats)
                 writer.close()
@@ -116,7 +120,9 @@ def cmd_encrypt(args) -> int:
                 writer.abort()
         else:
             with open(args.input_file, "rb") as src:
-                for piece in core.encrypt_stream(src, pub_bytes):
+                iterable = (core.encrypt_stream_rsa(src, rsa_pub) if rsa_pub
+                            else core.encrypt_stream(src, pub_bytes))
+                for piece in iterable:
                     out.write(piece)
     container_size = os.path.getsize(out_path)
 
@@ -139,22 +145,40 @@ def cmd_decrypt(args) -> int:
         password = getpass.getpass("Private key passphrase: ").encode()
     private_key = keys.load_private_key(args.private_key, password=password)
 
-    seed = private_key.private_bytes_raw()
-    public = private_key.public_key().public_bytes_raw()
-
     out_path = args.output_file or files.decrypted_output_path(args.input_file)
     # Where a partial (salvaged) result goes: never the real name by default.
     partial_path = args.output_file or files.unused_path(
         (out_path.rstrip("/") or out_path) + ".partial")
+
     with open(args.input_file, "rb") as src:
+        kind = core.peek_container_kind(src)
+        # A stream decryptor for this container + key (yields plaintext chunks,
+        # with optional salvage). Matches the container scheme to the key type.
+        if kind == "rsa":
+            if private_key.type != "rsa":
+                raise keys.KeyError_(
+                    f"this file is RSA-encrypted; the key provided is "
+                    f"{private_key.type} - supply the matching RSA private key")
+            ds = lambda s, sv=False: core.decrypt_stream_rsa(s, private_key.key, salvage=sv)
+        elif kind == "ed25519":
+            if private_key.type != "ed25519":
+                raise keys.KeyError_(
+                    f"this file is Ed25519-encrypted; the key provided is "
+                    f"{private_key.type} - supply the matching Ed25519 private key")
+            seed = private_key.key.private_bytes_raw()
+            public = private_key.key.public_key().public_bytes_raw()
+            ds = lambda s, sv=False: core.decrypt_stream(s, seed, public, salvage=sv)
+        else:
+            raise ValueError("not a PKCrypt file (bad header)")
+
         if core.peek_payload_type(src) == core.PAYLOAD_ARCHIVE:
-            return _decrypt_folder(args.input_file, src, seed, public, out_path,
+            return _decrypt_folder(args.input_file, src, ds, out_path,
                                    args.salvage, partial_path)
         if args.salvage:
-            return _salvage_file(args.input_file, src, seed, public, out_path, partial_path)
+            return _salvage_file(args.input_file, src, ds, out_path, partial_path)
         # Stream the container chunk-by-chunk so large files never load into memory.
         with files.AtomicOutput(out_path) as out:
-            for piece in core.decrypt_stream(src, seed, public):
+            for piece in ds(src):
                 out.write(piece)
     plaintext_size = os.path.getsize(out_path)
     print(f"Decrypted {args.input_file} -> {out_path}")
@@ -166,14 +190,13 @@ def _decrypt_error(exc: Exception) -> str:
     return core.DECRYPT_FAILED if isinstance(exc, InvalidTag) else str(exc)
 
 
-def _salvage_file(in_path: str, src, seed: bytes, public: bytes, out_path: str,
-                  partial_path: str) -> int:
+def _salvage_file(in_path: str, src, ds, out_path: str, partial_path: str) -> int:
     """Decrypt a single file, publishing its verified start as a partial
     result if the rest fails to verify."""
     out = files.AtomicOutput(out_path)
     written = 0
     try:
-        for piece in core.decrypt_stream(src, seed, public, salvage=True):
+        for piece in ds(src, sv=True):
             out.write(piece)
             written += len(piece)
     except (InvalidTag, ValueError) as exc:
@@ -196,7 +219,7 @@ def _salvage_file(in_path: str, src, seed: bytes, public: bytes, out_path: str,
     return EXIT_OK
 
 
-def _decrypt_folder(in_path: str, src, seed: bytes, public: bytes, out_path: str,
+def _decrypt_folder(in_path: str, src, ds, out_path: str,
                     salvage: bool = False, partial_path: str = "") -> int:
     """Decrypt an archive container and recreate the folder at ``out_path``.
 
@@ -213,7 +236,7 @@ def _decrypt_folder(in_path: str, src, seed: bytes, public: bytes, out_path: str
         failure = None
         with os.fdopen(fd, "wb") as tmp:
             try:
-                for piece in core.decrypt_stream(src, seed, public, salvage=salvage):
+                for piece in ds(src, sv=salvage):
                     tmp.write(piece)
             except (InvalidTag, ValueError) as exc:
                 if not salvage:
