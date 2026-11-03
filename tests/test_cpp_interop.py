@@ -86,12 +86,27 @@ def run_with_input(input_bytes: bytes, *cmd):
                 out += d
         return out
 
-    time.sleep(0.7)
+    # Wait for the prompt before typing: getpass() turns echo off with
+    # TCSAFLUSH, which DISCARDS input typed before that point, and only then
+    # prints the prompt. A fixed sleep raced it on slow CI runners (Python's
+    # startup + `cryptography` import can exceed it), losing the passphrase.
+    seen = b""
+    end = time.time() + 30
+    while b"assphrase" not in seen and time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                d = os.read(fd, 1024)
+            except OSError:
+                break
+            if not d:
+                break
+            seen += d
     try:
         os.write(fd, input_bytes)
     except OSError:
         pass
-    out = drain(15.0)
+    out = seen + drain(15.0)
     os.close(fd)
     _pid, status = os.waitpid(pid, 0)
     code = os.waitstatus_to_exitcode(status)

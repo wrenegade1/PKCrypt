@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import os
 import random
+import shutil
 import re
 import stat
 import struct
@@ -463,8 +464,8 @@ def test_streamed_zip_readable_by_other_tools(tmp_path):
         assert all(i.flag_bits & 0x08 for i in zf.infolist() if not i.is_dir())
     expected = {k: v for k, v in tree(lib).items() if v is not None}
     assert files == expected
-    unzip = subprocess.run(["unzip", "-tq", str(archive)], capture_output=True)
-    if unzip.returncode != 127:                      # skip if unzip is missing
+    if shutil.which("unzip"):                        # skip if unzip is missing
+        unzip = subprocess.run(["unzip", "-tq", str(archive)], capture_output=True)
         assert unzip.returncode == 0, unzip.stdout + unzip.stderr
 
 

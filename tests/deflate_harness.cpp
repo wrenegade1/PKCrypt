@@ -147,12 +147,14 @@ int main(int argc, char** argv) {
             std::cerr << "invalid base64\n";
             return 1;
         }
-        std::fwrite(out.data(), 1, out.size(), stdout);
+        if (!out.empty()) std::fwrite(out.data(), 1, out.size(), stdout);
         return 0;
     } else {
         std::cerr << "unknown mode: " << mode << "\n";
         return 2;
     }
-    std::fwrite(out.data(), 1, out.size(), stdout);
+    // An empty vector's data() may be null, and glibc declares fwrite's buffer
+    // nonnull: UBSan (Linux CI) aborts on fwrite(nullptr, 1, 0, ...).
+    if (!out.empty()) std::fwrite(out.data(), 1, out.size(), stdout);
     return 0;
 }
